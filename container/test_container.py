@@ -32,12 +32,18 @@ def test_supervisord_programs_all_autostart_false(supervisord_conf):
     for section in programs:
         assert supervisord_conf.get(section, "autostart") == "false"
         assert supervisord_conf.get(section, "autorestart") == "true"
-        # 日志汇到容器 stdout，组内进程一起停，避免 uvicorn 子进程残留
-        assert supervisord_conf.get(section, "stdout_logfile") == "/dev/stdout"
-        assert supervisord_conf.get(section, "stdout_logfile_maxbytes") == "0"
-        assert supervisord_conf.get(section, "redirect_stderr") == "true"
+        # 组内进程一起停，避免 uvicorn 子进程残留
         assert supervisord_conf.get(section, "stopasgroup") == "true"
         assert supervisord_conf.get(section, "killasgroup") == "true"
+        assert supervisord_conf.get(section, "redirect_stderr") == "true"
+        # 日志默认汇到容器 stdout（docker logs 聚合）。lxserver 是唯一例外：
+        # issue #108 已证实 stdout 单向管道读不回来，管理页导出拿不到它的运行
+        # 日志，因此改为落盘到共享日志根，详见 test_lxserver_logging.py。
+        if section == "program:lxserver":
+            assert supervisord_conf.get(section, "stdout_logfile").startswith("/data/logs/")
+            continue
+        assert supervisord_conf.get(section, "stdout_logfile") == "/dev/stdout"
+        assert supervisord_conf.get(section, "stdout_logfile_maxbytes") == "0"
 
 
 def test_supervisord_ports_and_directories(supervisord_conf):
@@ -181,6 +187,9 @@ def _run_entrypoint(fake_bin: Path, env_file: Path, log: Path, tmp_path: Path | 
         env["LX_DATA_DIR"] = str(data_dir / "lxmusic")
         # 镜像容器形态的 XDG_DATA_HOME=/data：musicbox cookie 启发判断用
         env["XDG_DATA_HOME"] = str(data_dir)
+        # 真实环境 Dockerfile ENV 与 native systemd unit 都导出日志根；
+        # 宿主测试不设会落到只读 /repo，entrypoint 建目录即失败
+        env["FNMUSIC_LOG_DIR"] = str(tmp_path / "logs")
     proc = subprocess.run(
         ["sh", str(CONTAINER_DIR / "entrypoint.sh")],
         capture_output=True, text=True, timeout=30,
@@ -347,7 +356,7 @@ def test_dockerfile_assembly():
 def test_container_logging_root_contract():
     text = (CONTAINER_DIR / "Dockerfile").read_text(encoding="utf-8")
     env_block = text.split("ENV ", 1)[1].split("\n\n", 1)[0]
-    assert "FNMUSIC_LOG_DIR=/repo/logs" in env_block
+    assert "FNMUSIC_LOG_DIR=/data/logs" in env_block
     assert "groupadd -g 1000 appuser" in text
     assert "useradd -m -u 1000 -g 1000 appuser" in text
     assert "USER appuser" in text
@@ -381,10 +390,14 @@ def test_dockerfile_network_fallback_resilience():
     assert "if ! apt-get update" not in text
     assert "lists_fetched" in apt_step and "/var/lib/apt/lists" in apt_step
     assert "|| true)" in apt_step  # find 失败不得被 set -e 打死
-    # 镜像源与官方源双失败要给出带排查建议的明确错误；禁止 [ERROR] 污染弹窗 grep
+    # 镜像源与官方源双失败要给出带排查建议的明确错误；禁止 [ERROR] 污染弹窗 grep。
+    # 全文件（含注释）不得出现字面 [ERROR]：BuildKit 失败时会带行号回显 Dockerfile
+    # 上下文，注释里的字面 [ERROR] 同样会被应用中心弹窗错误摘要误收（issue #109）。
     assert "均未取到索引" in apt_step
     assert "daemon.json" in apt_step
-    assert 'echo "[ERROR]' not in text
+    assert "[ERROR]" not in text
+    # 双源失败时必须报告备用 DNS 注入是否真正生效，区分「注入失败」与「源不可达」
+    assert "注入未生效" in apt_step
     # pip 步骤：同样自带 DNS 自愈（resolv.conf 改写不跨 RUN 层）+ 官方 PyPI 回退
     pip_step = text.split("# 四个服务的")[1]
     assert "getent hosts" not in pip_step
@@ -464,3 +477,79 @@ def test_dockerfile_copies_proxy_modules_imported_by_services():
         origin = origins.get(module_name, "Dockerfile COPY")
         assert module in copied, f"{origin} 依赖 {module}，Dockerfile 需 COPY 进镜像"
         assert f"!{module}" in ignore, f"{origin} 依赖 {module}，.dockerignore 需放行构建上下文"
+
+
+def test_entrypoint_creates_log_root_before_supervisord(tmp_path):
+    """日志根不存在时 supervisord 因 logfile 目录缺失整体启动失败（CI 实证）。
+
+    entrypoint 必须在拉起 supervisord 前先建日志根；Docker 与 native 共用
+    此入口，目录取 FNMUSIC_LOG_DIR（容器 /data/logs，native 为仓库 logs）。
+    """
+    log = tmp_path / "ctl.log"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    FakeSupervisor(fake_bin, log)
+    env_file = tmp_path / ".env"
+    env_file.write_text("FNMUSIC_MUSICDL_ENABLED=true\n", encoding="utf-8")
+    # 深层不存在的日志根：验证 mkdir -p 语义，而非仅一层目录
+    log_root = tmp_path / "repo-root" / "nested" / "logs"
+    env = {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "ENV_FLAG_LIB": str(CONTAINER_DIR / "env_flag.sh"),
+        "SUPERVISOR_CONF": "/nonexistent/supervisord.conf",
+        "FNMUSIC_ENV_FILE": str(env_file),
+        "FNMUSIC_LOG_DIR": str(log_root),
+        # 重定向数据目录：宿主 macOS 上 /data 只读，容器外测试必须指到临时目录
+        "DATA_PATH": str(tmp_path / "data" / "lxserver"),
+        "LX_DATA_DIR": str(tmp_path / "data" / "lxmusic"),
+        "XDG_DATA_HOME": str(tmp_path / "data"),
+    }
+    proc = subprocess.run(
+        ["sh", str(CONTAINER_DIR / "entrypoint.sh")],
+        capture_output=True, text=True, timeout=30, env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert log_root.is_dir(), "entrypoint 应在 supervisord 启动前创建日志根目录"
+
+
+def _install_function(name):
+    text = (REPO_ROOT / "install.sh").read_text(encoding="utf-8")
+    start = text.index(name + "() {")
+    return text[start:text.index("\n}\n", start) + 3]
+
+
+def _safe_install_shell(tmp_path, body):
+    # shell 的 cwd 位于独占临时目录，且所有参数使用正斜杠路径。
+    # 禁止把 Windows 反斜杠路径插入 bash 源码（会吞反斜杠并在仓库内写坏路径）。
+    script = "set -euo pipefail\n" + _install_function("read_dotenv_value") + body
+    return subprocess.run(
+        ["bash", "-c", script], cwd=tmp_path, capture_output=True, text=True,
+        timeout=15, env=os.environ.copy(),
+    )
+
+
+def test_install_missing_dotenv_key_is_empty_not_failure(tmp_path):
+    (tmp_path / ".env").write_text("CUSTOM_KEY='keep'\n", encoding="utf-8")
+    result = _safe_install_shell(tmp_path, '\nvalue="$(read_dotenv_value .env FNMUSIC_LX_ENABLED)"\nprintf "ok:%s" "$value"\n')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "ok:"
+
+
+@pytest.mark.parametrize("enabled", ["true", "1", "yes", "on", "TRUE"])
+def test_install_preserves_partial_existing_source_flags(tmp_path, enabled):
+    (tmp_path / ".env").write_text(
+        f'export FNMUSIC_NETEASE_ENABLED = "{enabled}"\r\n', encoding="utf-8")
+    body = _install_function("parse_sources") + '''
+BASE_DIR="$PWD"
+log_info() { :; }
+parse_sources ""
+printf '%s:%s:%s:%s' "$ENABLE_MUSICDL" "$ENABLE_MUSICBOX" "$ENABLE_LX" "$KEEP_SOURCES_FROM_ENV"
+'''
+    result = _safe_install_shell(tmp_path, body)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "0:1:0:1"
+
+
+def test_install_does_not_unlink_shared_env_lock():
+    text = (REPO_ROOT / "install.sh").read_text(encoding="utf-8")
+    assert 'rm -f "${ENV_PATH}.lock"' not in text

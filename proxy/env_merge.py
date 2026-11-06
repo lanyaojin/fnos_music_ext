@@ -8,7 +8,7 @@ install.sh 在写入 .env 前先收集“本次安装期望的配置”，再调
 - 新版本引入的新配置项 / 缺失配置项自动安全补齐；
 - 用户手工添加的自定义键原样保留；
 - 用户手写的注释/非赋值行按原顺序去重后保留在文件末尾（合并多次不堆积）；
-- 合并结果原子写入并保持 0600 权限，合并前由调用方负责备份。
+- 合并结果原子写入并保持 0640 权限及已有共享组，合并前由调用方负责备份。
 
 CLI:
     python3 proxy/env_merge.py --existing .env --desired desired.env \
@@ -34,13 +34,46 @@ def env_file_lock(path: str | Path):
     """Serialize read/merge/replace across the host proxy and WebUI."""
     with _ENV_LOCK:
         lock_path = Path(str(Path(path).resolve()) + ".lock")
-        with lock_path.open("a+b") as lock:
+
+        def _open_lock():
+            # Stale root-owned 0640 lock files (from older installs) block
+            # non-root callers (appuser / dropped proxy) from opening with
+            # "a+b" (flock LOCK_EX needs write permission). Self-heal by
+            # unlinking the stale file and recreating it group-writable.
+            try:
+                return lock_path.open("a+b")
+            except PermissionError:
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    pass
+                return lock_path.open("a+b")
+
+        with _open_lock() as lock:
             if os.name == "posix":
                 import fcntl
-                if Path(path).exists() and os.geteuid() == 0:
-                    owner = Path(path).stat()
-                    os.fchown(lock.fileno(), owner.st_uid, owner.st_gid)
-                os.fchmod(lock.fileno(), 0o600)
+                import stat as _stat
+                p = Path(path)
+                if p.exists():
+                    st = p.stat()
+                    if os.geteuid() == 0:
+                        try:
+                            os.fchown(lock.fileno(), -1, st.st_gid)
+                        except OSError:
+                            pass
+                    # flock(LOCK_EX) requires the fd to be opened for writing,
+                    # so the lock MUST be group-writable even though .env itself
+                    # is 0640 (group read-only, for secret protection).
+                    lock_mode = _stat.S_IMODE(st.st_mode) | 0o020
+                else:
+                    lock_mode = 0o660
+                try:
+                    os.fchmod(lock.fileno(), lock_mode)
+                except (OSError, PermissionError):
+                    # Non-owner (appuser / dropped proxy) cannot fchmod a
+                    # root-created lock file; the mode was already set correctly
+                    # by the creator, so just continue.
+                    pass
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             else:
                 import msvcrt
@@ -64,6 +97,9 @@ LX_COMMENT = "洛雪音乐源 lxmusic（第三音源，宿主机端口 8772 -> �
 LX_DEFAULTS: "list[tuple[str, str]]" = [
     ("FNMUSIC_LX_ENABLED", "true"),
     ("FNMUSIC_LX_URL", "http://127.0.0.1:8772"),
+    ("FNMUSIC_LX_AUTO_SWITCH", "true"),
+    ("FNMUSIC_LX_PLATFORM_PREFERRED", "false"),
+    ("FNMUSIC_LX_SOURCE_ORDER", "[]"),
 ]
 LX_PREFIX = "FNMUSIC_LX_"
 
@@ -128,6 +164,28 @@ def merge_env(
     explicit = set(explicit or ())
     existing_map = dict(existing)
     desired_map = dict(desired)
+    if any(key.startswith("FNMUSIC_") for key in existing_map.keys() | desired_map.keys()):
+        # 先迁移旧偏好，再补安装默认值；不能让默认lossless覆盖旧balanced/smooth。
+        # 同时支持包导入和安装脚本直接执行本文件，不维护第二套映射。
+        try:
+            from .quality_policy import quality_migration
+        except ImportError:
+            from quality_policy import quality_migration
+        legacy_keys = {"FNMUSIC_QUALITY_MODE", "FNMUSIC_DL_QUALITY",
+                       "FNMUSIC_LX_QUALITY", "FNMUSIC_NETEASE_QUALITY"}
+        context = dict(existing_map)
+        context.update({key: value for key, value in desired_map.items() if key in explicit})
+        proposals = (quality_migration(context) if legacy_keys.intersection(existing_map)
+                     else {"FNMUSIC_PLAY_QUALITY": "lossless", "FNMUSIC_DOWNLOAD_QUALITY": "app"})
+        for key, value in proposals.items():
+            if key in explicit or str(existing_map.get(key) or "").strip():
+                continue
+            desired_map[key] = value
+            if key in existing_map:
+                explicit.add(key)  # 空白新键也需要完成一次幂等迁移。
+        desired = [(key, desired_map[key]) for key, _ in desired]
+        seen_desired = {key for key, _ in desired}
+        desired += [(key, value) for key, value in desired_map.items() if key not in seen_desired]
     result: list[tuple[str, str]] = []
     seen: set[str] = set()
     summary = {"added": [], "updated": [], "preserved": [], "custom_kept": []}
@@ -227,7 +285,7 @@ def preserve_user_comments(
     return out
 
 
-def write_env_atomic(path: str | Path, content: str, mode: int = 0o600) -> None:
+def write_env_atomic(path: str | Path, content: str, mode: int = 0o640) -> None:
     path = Path(path)
     try:
         existing = path.stat()
@@ -237,10 +295,13 @@ def write_env_atomic(path: str | Path, content: str, mode: int = 0o600) -> None:
     try:
         with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
             f.write(content)
-            # Native WebUI runs as root, but the installer user's private .env
-            # must remain readable by that user after an atomic replacement.
-            if existing is not None and getattr(os, "geteuid", lambda: -1)() == 0 and hasattr(os, "fchown"):
-                os.fchown(f.fileno(), existing.st_uid, existing.st_gid)
+            # 原子替换不能丢失已有共享组。root保留完整属主；非root只改组，
+            # 内核允许使用补充组，拒绝时必须在replace之前失败并保留旧配置。
+            if existing is not None and hasattr(os, "fchown"):
+                if getattr(os, "geteuid", lambda: -1)() == 0:
+                    os.fchown(f.fileno(), existing.st_uid, existing.st_gid)
+                elif os.fstat(f.fileno()).st_gid != existing.st_gid:
+                    os.fchown(f.fileno(), -1, existing.st_gid)
             if hasattr(os, "fchmod"):
                 os.fchmod(f.fileno(), mode)
         os.replace(tmp_name, str(path))

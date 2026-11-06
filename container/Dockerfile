@@ -15,7 +15,7 @@ ENV PYTHONUNBUFFERED=1 \
     XDG_CONFIG_HOME=/data/config \
     LX_DATA_DIR=/data/lxmusic \
     WEBUI_REPO_DIR=/repo \
-    FNMUSIC_LOG_DIR=/repo/logs
+    FNMUSIC_LOG_DIR=/data/logs
 
 WORKDIR /srv
 
@@ -25,7 +25,8 @@ WORKDIR /srv
 # 因此不探测、始终把国内可达的公共 DNS 写到最前（写入失败不中断）；apt-get update
 # 对 DNS 失败只报 W: 警告且退出码为 0，回退判定看「索引是否真正落地」而非退出码；
 # 镜像源与官方源都取不到索引才判失败。安装完成后恢复官方源，宿主机与最终镜像不受影响。
-# 失败文案用 "ERROR:" 不用 "[ERROR]"：后者会被应用中心弹窗 grep 成整段 RUN 标题。
+# 失败文案统一用 "ERROR:" 前缀，不得写出带方括号的 ERROR 标记（注释里也不行）：
+# BuildKit 失败时按行号回显本文件上下文，该字样会被应用中心弹窗错误摘要误收（#109）。
 RUN set -eu; \
     fix_dns() { \
         { \
@@ -53,6 +54,9 @@ RUN set -eu; \
         apt_update; \
     fi; \
     if ! lists_fetched; then \
+        if ! grep -q '^nameserver 223\.5\.5\.5' /etc/resolv.conf 2>/dev/null; then \
+            echo "ERROR: 构建容器备用 DNS 注入未生效（/etc/resolv.conf 不可改写或被覆盖）。" >&2; \
+        fi; \
         echo "ERROR: apt 镜像源与官方源均未取到索引：构建容器无法访问 Debian 源。" >&2; \
         echo "ERROR: 若宿主机 /etc/resolv.conf 的 DNS 指向本机（127.x），Docker 容器无法复用，" >&2; \
         echo "ERROR: 可在 Docker daemon.json 配置 \"dns\": [\"223.5.5.5\"] 并重启 Docker 后重试。" >&2; \
@@ -86,7 +90,7 @@ RUN set -eu; \
 
 RUN groupadd -g 1000 appuser \
     && useradd -m -u 1000 -g 1000 appuser \
-    && mkdir -p /data/cache /data/config /data/lxmusic /data/lxserver \
+    && mkdir -p /data/cache /data/config /data/lxmusic /data/lxserver /data/logs \
     && chown -R appuser:appuser /data
 
 # lxserver 预编译包引入：构建上下文优先（预置离线 zip）+ 多镜像加速回退链
@@ -151,11 +155,17 @@ RUN set -eu; \
 # --chown+chmod：镜像权限不依赖构建上下文的 umask/属主
 COPY --chown=appuser:appuser musicdl-service/app.py musicdl-service/hardening.py musicdl-service/search_core.py musicdl-service/worker.py /srv/musicdl-service/
 COPY --chown=appuser:appuser musicbox-service/app.py musicbox-service/runner.py musicbox-service/netease_ext.py musicbox-service/playback.py /srv/musicbox-service/
-COPY --chown=appuser:appuser lxmusic-service/app.py lxmusic-service/lxserver_client.py lxmusic-service/verify_source.py /srv/lxmusic-service/
+# 音质 + 播放编排新模块随本轮一并分发：
+#   proxy/quality_policy.py        —— A 组（主智能体）共享七档音质策略
+#   lxmusic-service/playback_policy.py —— B 组（洛雪）播放编排
+# 两个文件属其他并行分支，本轮合入前文件可能尚不存在：那时 COPY 会失败，
+# 这是刻意保留的硬失败——不能删掉 COPY 行绕过，否则容器里缺少模块会在
+# 运行期才报 ModuleNotFoundError。集成时请先确认两个文件已落盘。
+COPY --chown=appuser:appuser lxmusic-service/app.py lxmusic-service/lxserver_client.py lxmusic-service/verify_source.py lxmusic-service/playback_policy.py /srv/lxmusic-service/
 COPY --chown=appuser:appuser webui-service/app.py /srv/webui-service/
 COPY --chown=appuser:appuser webui-service/static/ /srv/webui-service/static/
 # webui/lxmusic/musicbox 复用 proxy 模块（.env 安全合并 + 统一日志 fnlog），必须随镜像分发
-COPY --chown=appuser:appuser proxy/__init__.py proxy/direct_play.py proxy/env_merge.py proxy/fnlog.py proxy/llm_usage.py proxy/media_url.py proxy/publicplaylists.py proxy/version.py /srv/proxy/
+COPY --chown=appuser:appuser proxy/__init__.py proxy/direct_play.py proxy/env_merge.py proxy/fnlog.py proxy/llm_usage.py proxy/media_url.py proxy/publicplaylists.py proxy/quality_policy.py proxy/version.py /srv/proxy/
 COPY --chown=appuser:appuser VERSION RELEASE_CHANNEL /srv/
 RUN chmod 0644 /srv/VERSION /srv/RELEASE_CHANNEL \
     && find /srv -name "*.py" -exec chmod 0644 {} + \

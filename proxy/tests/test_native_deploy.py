@@ -286,7 +286,8 @@ def test_ensure_sources_native_lxserver_provision_idempotent(tmp_path):
                 repo / "container/ensure_lxserver_native.sh")
     shutil.copy(BASE / "container/lxserver_compat.py", repo / "container/lxserver_compat.py")
     compat = _load_module("container/lxserver_compat.py", "native_provision_compat_test")
-    upstream_api = "\n".join((compat.ANCHOR_BTOA, compat.ANCHOR_CALL_OLD, compat.ANCHOR_AES_OLD))
+    upstream_api = "\n".join((compat.ANCHOR_BTOA, compat.ANCHOR_CALL_OLD, compat.ANCHOR_AES_OLD,
+                              compat.ANCHOR_RETRIES))
     for req in ("musicdl-service", "musicbox-service", "lxmusic-service", "webui-service"):
         (repo / req).mkdir()
         (repo / req / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
@@ -298,6 +299,8 @@ def test_ensure_sources_native_lxserver_provision_idempotent(tmp_path):
         zf.writestr("lx-music-sync-server/index.js", "#!/usr/bin/env node\nrequire('./server/server');\n")
         zf.writestr("lx-music-sync-server/server/server.js", f"#!/usr/bin/env node\n{original_line}\n")
         zf.writestr("lx-music-sync-server/server/server/userApi.js", upstream_api)
+        zf.writestr("lx-music-sync-server/server/server/customSourceHandlers.js",
+                    compat.ANCHOR_CAPABILITIES)
     sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
     native_tarball = repo / "container/lxserver-artifact/music-tag-native-linux-arm64-gnu-0.2.5.tgz"
     package_dir = tmp_path / "native-package" / "package"
@@ -541,3 +544,16 @@ sudo() { printf 'mock-sudo %s\\n' "$*"; }
     assert ("stop fnmusic-sources --adopt" in result.stdout) == adopt
     assert ("mock-sudo rm -f /etc/systemd/system/fnmusic-sources.service" in result.stdout) == adopt
     assert ("remove fnmusic-sources --adopt" in result.stdout) == adopt
+
+
+def test_native_unit_log_dir_matches_supervisor_lxserver_logfile():
+    """native 侧 lxserver 日志读写必须同源。
+
+    unit 导出的 FNMUSIC_LOG_DIR 与 supervisord-native.conf.in 的 lxserver
+    logfile 使用同一目录，entrypoint 才能凭同一变量先建目录——supervisord
+    遇到不存在的 logfile 目录会整体启动失败（CI 实证，非仅 lxserver 受损）。
+    """
+    unit = (BASE / "fnmusic-sources-native.service.in").read_text(encoding="utf-8")
+    sup = (BASE / "container" / "supervisord-native.conf.in").read_text(encoding="utf-8")
+    assert 'Environment="FNMUSIC_LOG_DIR=@REPO@/logs"' in unit
+    assert "stdout_logfile=@REPO@/logs/lxserver.log" in sup

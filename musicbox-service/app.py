@@ -50,7 +50,8 @@ except Exception:  # noqa: BLE001  无 proxy/ 上下文（如独立调试）时�
 ensure_xdg_dirs()
 
 SEARCH_TYPES = {"song", "album", "artist", "playlist"}
-QUALITY_WHITELIST = {"exhigh", "higher", "standard", "lossless", "hires", "jymaster"}
+# 统一官方七档支持：standard, higher, exhigh, lossless, hires, jymaster, sky
+QUALITY_WHITELIST = {"standard", "higher", "exhigh", "lossless", "hires", "jymaster", "sky"}
 
 
 class UpstreamException(Exception):
@@ -220,11 +221,14 @@ def search(
 
 
 @app.get("/api/v1/song/{song_id}/url")
-async def song_url(song_id: int = Path(..., ge=1), quality: str = Query("exhigh"), fresh: int = Query(0)):
+async def song_url(song_id: int = Path(..., ge=1), quality: str = Query("exhigh"), fresh: int = Query(0),
+                    purpose: str = Query("playback"), generation: int = Query(0, ge=0)):
     if quality not in QUALITY_WHITELIST:
         raise HTTPException(status_code=400, detail=f"Invalid quality {quality!r}")
+    purpose = "download" if purpose.strip().lower() == "download" else "playback"
     try:
-        item = await get_song_url_async(song_id, quality, fresh=bool(fresh))
+        item = await get_song_url_async(
+            song_id, quality, fresh=bool(fresh), purpose=purpose, context_generation=generation)
         return {"ok": True, "data": item}
     except playback.ResolutionTimeout as exc:
         raise HTTPException(status_code=504, detail=str(exc)) from exc

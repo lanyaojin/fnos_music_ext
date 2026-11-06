@@ -35,11 +35,18 @@ def isolated(tmp_path, monkeypatch):
     p._full_fetch_failed.clear()
     p._scan_last_attempt = 0.0
     p._scan_task = None
+    if hasattr(p, "_scan_pending_headers"):
+        p._scan_pending_headers = None
     monkeypatch.setitem(p.CONF, "library_scan_path", "")
     os.makedirs(p.CONF["library_dir"], exist_ok=True)
     yield
     p._full_fetch_tasks.clear()
     p._full_fetch_failed.clear()
+    if p._scan_task is not None and not p._scan_task.done():
+        p._scan_task.cancel()
+    p._scan_last_attempt = 0.0
+    if hasattr(p, "_scan_pending_headers"):
+        p._scan_pending_headers = None
 
 
 class Audio(httpx.AsyncByteStream):
@@ -1007,3 +1014,270 @@ def test_staged_reuse_promotes_shadow_lyric_without_touching_audio(tmp_path, mon
     assert not os.path.exists(shadow)
     with open(os.path.splitext(dest)[0] + ".lrc", encoding="utf-8") as f:
         assert "影子歌词" in f.read()
+
+
+@pytest.mark.anyio
+async def test_library_scan_config_body_and_headers(monkeypatch):
+    """「路径|JSON体」配置：请求带 JSON body 与 content-type；透传会话凭证（cookie），
+    但绝不透传绑定特定路径的不可重放 authx 签名。"""
+    monkeypatch.setitem(p.CONF, "library_scan_path",
+                        '/music/api/v1/shared-library/scan|{"guid":"64d1b8ca"}')
+    posts = []
+
+    class ScanTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            posts.append({
+                "path": request.url.path,
+                "body": request.content.decode("utf-8"),
+                "ctype": request.headers.get("content-type"),
+                "cookie": request.headers.get("cookie"),
+                "authx": request.headers.get("authx"),
+            })
+            return httpx.Response(200, json={"code": 0})
+
+    client = httpx.AsyncClient(transport=ScanTransport(), base_url="http://unix")
+    monkeypatch.setattr(p, "get_upstream_client", lambda a: client)
+    try:
+        headers = {"cookie": "music-token=tok123", "authx": "nonce=1&timestamp=2&sign=abc"}
+        p._schedule_library_scan(headers)
+        await asyncio.wait_for(p._scan_task, timeout=5.0)
+        assert len(posts) == 1
+        sent = posts[0]
+        assert sent["path"] == "/music/api/v1/shared-library/scan"
+        assert sent["body"] == '{"guid":"64d1b8ca"}'
+        assert sent["ctype"] == "application/json"
+        assert sent["cookie"] == "music-token=tok123"
+        # 认证安全：不能假定 authx 可跨路径重放，必须剔除
+        assert sent.get("authx") is None
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_library_scan_legacy_path_without_body(monkeypatch):
+    """旧格式（纯路径无竖线）：POST 无 body，不设 content-type。"""
+    monkeypatch.setitem(p.CONF, "library_scan_path", "/music/api/v1/shared-library/scan")
+    posts = []
+
+    class ScanTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            posts.append({"body": request.content, "ctype": request.headers.get("content-type")})
+            return httpx.Response(200, json={"code": 0})
+
+    client = httpx.AsyncClient(transport=ScanTransport(), base_url="http://unix")
+    monkeypatch.setattr(p, "get_upstream_client", lambda a: client)
+    try:
+        p._schedule_library_scan({"cookie": "sid=x"})
+        await asyncio.wait_for(p._scan_task, timeout=5.0)
+        assert posts[0]["body"] == b""
+        assert posts[0]["ctype"] is None
+    finally:
+        await client.aclose()
+
+
+def test_scan_config_parsing():
+    """配置解析：三态（空/纯路径/路径|JSON），空白容错。"""
+    monkey = p.CONF
+    monkey["library_scan_path"] = ""
+    assert p._scan_config() == ("", "")
+    monkey["library_scan_path"] = "/music/api/v1/x"
+    assert p._scan_config() == ("/music/api/v1/x", "")
+    monkey["library_scan_path"] = ' /music/api/v1/x | {"guid":"g1"} '
+    assert p._scan_config() == ("/music/api/v1/x", '{"guid":"g1"}')
+    monkey["library_scan_path"] = "/p|"
+    assert p._scan_config() == ("/p", "")
+
+
+def test_scan_config_security_rejects_external_and_malformed():
+    """安全校验：禁止外部 URL、禁止控制字符、禁止相对路径、禁止非法 JSON。"""
+    monkey = p.CONF
+    # 外部 URL / scheme
+    monkey["library_scan_path"] = "http://evil.com/scan"
+    assert p._scan_config() == ("", "")
+    monkey["library_scan_path"] = "https://evil.com/scan"
+    assert p._scan_config() == ("", "")
+    monkey["library_scan_path"] = "//evil.com/scan"
+    assert p._scan_config() == ("", "")
+    # 相对路径 / 遍历
+    monkey["library_scan_path"] = "music/api/scan"
+    assert p._scan_config() == ("", "")
+    monkey["library_scan_path"] = "../scan"
+    assert p._scan_config() == ("", "")
+    # 控制字符
+    monkey["library_scan_path"] = "/music/api/scan\r\nHost: evil"
+    assert p._scan_config() == ("", "")
+    monkey["library_scan_path"] = "/music/api/scan\x00"
+    assert p._scan_config() == ("", "")
+    # 非法 JSON 请求体
+    monkey["library_scan_path"] = '/music/api/scan|not-a-json'
+    assert p._scan_config() == ("", "")
+    monkey["library_scan_path"] = '/music/api/scan|{"guid": unfinished'
+    assert p._scan_config() == ("", "")
+    monkey["library_scan_path"] = '/music/api/scan|{"guid":"ok\x00"}'
+    assert p._scan_config() == ("", "")
+
+
+@pytest.mark.anyio
+async def test_scan_delay_zero_fires_immediately(monkeypatch):
+    """延迟 0=立即发（不等合并窗口）；冷却 0=仅本请求不重复。"""
+    monkeypatch.setitem(p.CONF, "library_scan_path", "/music/api/v1/x|{}")
+    monkeypatch.setitem(p.CONF, "scan_delay_s", 0)
+    monkeypatch.setitem(p.CONF, "scan_cooldown_s", 0)
+    posts = []
+
+    class T(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            posts.append(request.url.path)
+            return httpx.Response(200, json={"code": 0})
+
+    client = httpx.AsyncClient(transport=T(), base_url="http://unix")
+    monkeypatch.setattr(p, "get_upstream_client", lambda a: client)
+    try:
+        t0 = time.monotonic()
+        p._schedule_library_scan({"cookie": "sid=x"})
+        await asyncio.wait_for(p._scan_task, timeout=5.0)
+        elapsed = time.monotonic() - t0
+        assert posts == ["/music/api/v1/x"]
+        assert elapsed < 1.0  # 立即发，未等 3 秒默认延迟
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_scan_custom_delay_and_cooldown(monkeypatch):
+    """自定义延迟与冷却窗口生效（热重载后的 CONF 值直接读取）。"""
+    monkeypatch.setitem(p.CONF, "library_scan_path", "/music/api/v1/x")
+    monkeypatch.setitem(p.CONF, "scan_delay_s", 1.0)
+    monkeypatch.setitem(p.CONF, "scan_cooldown_s", 5.0)
+    posts = []
+
+    class T(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            posts.append(request.url.path)
+            return httpx.Response(200, json={"code": 0})
+
+    client = httpx.AsyncClient(transport=T(), base_url="http://unix")
+    monkeypatch.setattr(p, "get_upstream_client", lambda a: client)
+    try:
+        p._schedule_library_scan({"cookie": "sid=x"})
+        t0 = time.monotonic()
+        await asyncio.wait_for(p._scan_task, timeout=5.0)
+        assert time.monotonic() - t0 >= 0.9  # 等 1 秒延迟
+        assert posts == ["/music/api/v1/x"]
+        # 冷却 5 秒内不重发
+        p._schedule_library_scan({"cookie": "sid=y"})
+        await asyncio.sleep(0.1)
+        assert posts == ["/music/api/v1/x"]
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_scan_cooldown_zero_allows_immediate_subsequent_scan(monkeypatch):
+    """重点修复：冷却为 0 时不能被默认值 90 秒吞掉。第一次完成后，第二次可立即发起。"""
+    monkeypatch.setitem(p.CONF, "library_scan_path", "/music/api/v1/scan")
+    monkeypatch.setitem(p.CONF, "scan_delay_s", 0)
+    monkeypatch.setitem(p.CONF, "scan_cooldown_s", 0)
+    posts = []
+
+    class T(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            posts.append(request.url.path)
+            return httpx.Response(200, json={"code": 0})
+
+    client = httpx.AsyncClient(transport=T(), base_url="http://unix")
+    monkeypatch.setattr(p, "get_upstream_client", lambda a: client)
+    try:
+        p._schedule_library_scan({"cookie": "sid=1"})
+        await asyncio.wait_for(p._scan_task, timeout=5.0)
+        assert len(posts) == 1
+
+        # 第二次请求立即触发，不会被 90 秒冷却阻拦
+        p._schedule_library_scan({"cookie": "sid=2"})
+        await asyncio.wait_for(p._scan_task, timeout=5.0)
+        assert len(posts) == 2
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_scan_pending_tasks_trigger_after_cooldown(monkeypatch):
+    """重点需求：冷却期间新增文件不能丢弃，待冷却窗口结束后自动触发重扫。"""
+    monkeypatch.setitem(p.CONF, "library_scan_path", "/music/api/v1/scan")
+    monkeypatch.setitem(p.CONF, "scan_delay_s", 0)
+    monkeypatch.setitem(p.CONF, "scan_cooldown_s", 0.3)
+    posts = []
+
+    class T(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            posts.append({"cookie": request.headers.get("cookie")})
+            return httpx.Response(200, json={"code": 0})
+
+    client = httpx.AsyncClient(transport=T(), base_url="http://unix")
+    monkeypatch.setattr(p, "get_upstream_client", lambda a: client)
+    try:
+        # 第一次扫描
+        p._schedule_library_scan({"cookie": "file1"})
+        await asyncio.wait_for(p._scan_task, timeout=5.0)
+        assert len(posts) == 1
+        assert posts[0]["cookie"] == "file1"
+
+        # 冷却期内（0.1s），第二首歌落盘
+        p._schedule_library_scan({"cookie": "file2"})
+        assert len(posts) == 1  # 还在冷却中，未立即发出
+
+        # 等待冷却结束并触发待扫任务
+        await asyncio.sleep(0.5)
+        if p._scan_task is not None and not p._scan_task.done():
+            await asyncio.wait_for(p._scan_task, timeout=5.0)
+
+        assert len(posts) == 2
+        assert posts[1]["cookie"] == "file2"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_scan_response_business_code_and_aclose(monkeypatch):
+    """业务码检查与响应关闭：HTTP 200 但业务 code != 0 判定未成功；响应对象必须关闭。"""
+    monkeypatch.setitem(p.CONF, "library_scan_path", "/music/api/v1/scan")
+    monkeypatch.setitem(p.CONF, "scan_delay_s", 0)
+    monkeypatch.setitem(p.CONF, "scan_cooldown_s", 0)
+    response_closed = False
+
+    class TrackingResponse(httpx.Response):
+        async def aclose(self):
+            nonlocal response_closed
+            response_closed = True
+            await super().aclose()
+
+    class T(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            return TrackingResponse(200, json={"code": -1, "message": "shared library busy"})
+
+    client = httpx.AsyncClient(transport=T(), base_url="http://unix")
+    monkeypatch.setattr(p, "get_upstream_client", lambda a: client)
+    try:
+        p._schedule_library_scan({"cookie": "sid=x"})
+        await asyncio.wait_for(p._scan_task, timeout=5.0)
+        # 响应必须关闭
+        assert response_closed is True
+    finally:
+        await client.aclose()
+
+
+def test_scan_number_defaults_on_invalid():
+    """非法/越界时间窗回落默认（0 允许）。"""
+    assert p._safe_scan_number("abc", 3.0, 0.0, 600.0) == 3.0
+    assert p._safe_scan_number("-5", 3.0, 0.0, 600.0) == 3.0
+    assert p._safe_scan_number("9999", 3.0, 0.0, 600.0) == 3.0
+    assert p._safe_scan_number("0", 3.0, 0.0, 600.0) == 0.0
+    assert p._safe_scan_number("45.5", 3.0, 0.0, 600.0) == 45.5
+    # 热重载校验器同口径：delay 上限 600，cooldown 上限 3600
+    assert p._env_watch_parse("0", "scan_delay") == 0.0
+    assert p._env_watch_parse("700", "scan_delay") is None
+    assert p._env_watch_parse("2.5", "scan_delay") == 2.5
+    assert p._env_watch_parse("0", "scan_cooldown") == 0.0
+    assert p._env_watch_parse("7200", "scan_cooldown") is None
+    assert p._env_watch_parse("1800.5", "scan_cooldown") == 1800.5
+

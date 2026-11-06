@@ -17,6 +17,7 @@ REQUEST_TIMEOUT = 5
 CALLBACK_TIMEOUT = 30
 CLEANUP_PATH = "/api/maintenance/cleanup"
 ORGANIZE_PATH = "/api/maintenance/organize"
+FS_CHECK_PATH = "/api/fs-check"
 LAYOUTS = frozenset(("flat", "artist", "album", "artist_album"))
 
 
@@ -45,7 +46,8 @@ def _route(method: str, path: str) -> bool:
             or (method == "GET" and re.fullmatch(CLEANUP_PATH + r"/[0-9a-fA-F]{32}", path) is not None)
             or (method == "POST" and path == ORGANIZE_PATH)
             or (method == "GET" and (path == ORGANIZE_PATH or
-                re.fullmatch(ORGANIZE_PATH + r"/[0-9a-fA-F]{32}", path) is not None)))
+                re.fullmatch(ORGANIZE_PATH + r"/[0-9a-fA-F]{32}", path) is not None))
+            or (method == "POST" and path == FS_CHECK_PATH))
 
 
 def _validate_body(method: str, path: str, body):
@@ -55,6 +57,15 @@ def _validate_body(method: str, path: str, body):
         if body != {"confirm_beta": True} or type(body.get("confirm_beta")) is not bool:
             raise ValueError("Explicit confirmation required")
         return {"confirm_beta": True}
+    if path == FS_CHECK_PATH:
+        if (not isinstance(body, dict) or set(body) != {"path"} or
+                not isinstance(body.get("path"), str)):
+            raise ValueError("Invalid fs-check body")
+        target = body["path"]
+        if (not target.startswith("/") or ".." in target.split("/") or
+                any(char in target for char in "\r\n\x00")):
+            raise ValueError("Invalid fs-check path")
+        return {"path": target}
     if (not isinstance(body, dict) or set(body) != {"confirm_beta", "root", "layout"} or
             type(body.get("confirm_beta")) is not bool or body.get("confirm_beta") is not True or
             not isinstance(body.get("layout"), str) or
@@ -199,7 +210,21 @@ async def start(loop, callback, path=DEFAULT_SOCKET):
             os.umask(old_umask)
         st = path.lstat()
         identity = (st.st_dev, st.st_ino)
-        os.chmod(path, 0o600)
+        # 0660 (not 0600) so the container's appuser (gid=APP_GID, shared with
+        # the host's Administrators group) can connect directly when the socket
+        # is bind-mounted into the container.  This lets maintenance endpoints
+        # (organize/cleanup/music-users) work even when the fnOS desktop gateway
+        # fails to intercept the request.
+        os.chmod(path, 0o660)
+        # Chown group to .env's group (APP_GID) so the container's appuser
+        # can connect when the socket is mounted into the container.
+        try:
+            _env = os.environ.get("FNMUSIC_ENV_FILE") or os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+            if os.path.isfile(_env):
+                os.chown(path, 0, os.stat(_env).st_gid)
+        except OSError:
+            pass
         sock.setblocking(False)
         server = await asyncio.start_unix_server(handle, sock=sock, limit=MAX_HEADER)
     except BaseException:

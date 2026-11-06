@@ -29,10 +29,47 @@ set -euo pipefail
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Shared outer lock is never acquired by systemd service helpers.
 source "${BASE_DIR}/proxy/install_common.sh"
+
+detect_container_ids() {
+    APP_UID="${PUID:-}"
+    APP_GID="${PGID:-}"
+    local dockerfile="${BASE_DIR}/container/Dockerfile"
+    # Dockerfile 里 useradd/groupadd 常写成 RUN 里的续行，不能用 ^RUN.* 匹配；
+    # 且 grep 无匹配会返回 1，在 set -euo pipefail 下会直接中断安装（安装日志空白）。
+    if [ -z "${APP_UID}" ] && [ -f "${dockerfile}" ]; then
+        APP_UID="$(grep -m1 'useradd' "${dockerfile}" 2>/dev/null \
+            | sed -n 's/.*-u[[:space:]]*\([0-9][0-9]*\).*/\1/p' || true)"
+    fi
+    if [ -z "${APP_GID}" ] && [ -f "${dockerfile}" ]; then
+        APP_GID="$(grep -m1 'groupadd' "${dockerfile}" 2>/dev/null \
+            | sed -n 's/.*-g[[:space:]]*\([0-9][0-9]*\).*/\1/p' || true)"
+    fi
+    if [ -z "${APP_UID}" ] && command -v docker >/dev/null 2>&1; then
+        local img
+        img="$(docker images -q fnmusic-sources:latest 2>/dev/null | head -n1)"
+        if [ -n "${img}" ]; then
+            local user
+            user="$(docker image inspect --format '{{.Config.User}}' "${img}" 2>/dev/null || true)"
+            if [[ "${user}" =~ ^([0-9]+):([0-9]+)$ ]]; then
+                [ -z "${APP_UID}" ] && APP_UID="${BASH_REMATCH[1]}"
+                [ -z "${APP_GID}" ] && APP_GID="${BASH_REMATCH[2]}"
+            elif [[ "${user}" =~ ^([0-9]+)$ ]]; then
+                [ -z "${APP_UID}" ] && APP_UID="${BASH_REMATCH[1]}"
+            fi
+        fi
+    fi
+    APP_UID="${APP_UID:-1000}"
+    APP_GID="${APP_GID:-1000}"
+    export APP_UID APP_GID
+}
+
+detect_container_ids
+
 installation_lock "$@"
 FNMUSIC_VERSION="$(head -n 1 "${BASE_DIR}/VERSION" 2>/dev/null | tr -d '[:space:]' || true)"
 FNMUSIC_VERSION="${FNMUSIC_VERSION:-0.0.0}"
 SOURCES_RAW=""
+SOURCES_EXPLICIT=0
 NON_INTERACTIVE=0
 ENABLE_RECOMMEND=""
 # 仅显式 --disable-recommend 才清除 .env 中已保存的大模型配置；
@@ -214,7 +251,7 @@ usage() {
 部署形态二选一：--deploy docker（默认，单容器按需加载，需 Docker）或
 --deploy native（原生宿主机 systemd + supervisord，无需 Docker）；
 同机两种形态互斥，切换部署形态请追加 --adopt。核心代理始终在宿主机 systemd 运行。
-密钥只写入仓库根目录 .env（chmod 600），不会进入 systemd 文件或日志。
+密钥只写入仓库根目录 .env（chmod 640，容器组可读），不会进入 systemd 文件或日志。
 EOF
 }
 
@@ -424,8 +461,47 @@ print_featured_mdl_menu() {
     echo "  直接回车 = 默认精选（酷我+咪咕）；输入 all = 平台白名单维持 .env 既有值。"
 }
 
+read_dotenv_value() {
+    local file="${1:-}"
+    local key="${2:-}"
+    [ -n "${file}" ] && [ -f "${file}" ] || return 0
+    # 缺少键是正常存量配置，不应因 grep=1 + pipefail 中断覆盖安装。
+    { grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "${file}" 2>/dev/null || true; } \
+        | tail -n1 | sed -E "s/^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=[[:space:]]*//" \
+        | tr -d '\r' | sed -E "s/[[:space:]]*$//; s/^['\"]|['\"]$//g"
+}
+
 parse_sources() {
     local raw="${1:-}"
+    # 覆盖安装（升级）：存量 .env 已有音源开关时以存量为准。
+    # 显式优先原则：
+    # 1. 命令行显式指定了 --sources（SOURCES_EXPLICIT=1）或传入非空非默认源时，必须优先采用显式选择；
+    # 2. 仅当未显式指定音源（raw 为空且 SOURCES_EXPLICIT=0）且存量 .env 存在时，才自动沿用存量配置。
+    # BASE_DIR 用默认空值：单测单独抽取本函数在 set -u 下裸跑，不定义 BASE_DIR
+    local env_file="${BASE_DIR:-}/.env"
+    local explicit=0
+    [ "${SOURCES_EXPLICIT:-0}" -eq 1 ] && explicit=1
+    [ -n "${raw}" ] && [ "${raw}" != "musicdl" ] && explicit=1
+
+    if [ "${explicit}" -eq 0 ] && [ -n "${BASE_DIR:-}" ] && [ -f "${env_file}" ]; then
+        local keep_mdl keep_box keep_lx
+        keep_mdl="$(read_dotenv_value "${env_file}" "FNMUSIC_MUSICDL_ENABLED" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+        keep_box="$(read_dotenv_value "${env_file}" "FNMUSIC_NETEASE_ENABLED" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+        keep_lx="$(read_dotenv_value "${env_file}" "FNMUSIC_LX_ENABLED" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+        if [ -n "${keep_mdl}${keep_box}${keep_lx}" ]; then
+            ENABLE_MUSICDL=0; ENABLE_MUSICBOX=0; ENABLE_LX=0
+            case "${keep_mdl}" in true|1|yes|on) ENABLE_MUSICDL=1 ;; esac
+            case "${keep_box}" in true|1|yes|on) ENABLE_MUSICBOX=1 ;; esac
+            case "${keep_lx}" in true|1|yes|on) ENABLE_LX=1 ;; esac
+            KEEP_SOURCES_FROM_ENV=1
+            MDL_EXPLICIT=0
+            MDL_PLATFORMS=""
+            LX_PLATFORMS=""
+            log_info "检测到存量音源配置 (musicdl=${ENABLE_MUSICDL} musicbox=${ENABLE_MUSICBOX} lx=${ENABLE_LX})，覆盖安装保留现有音源选择"
+            return 0
+        fi
+    fi
+    KEEP_SOURCES_FROM_ENV=0
     ENABLE_MUSICDL=0
     ENABLE_MUSICBOX=0
     ENABLE_LX=0
@@ -526,8 +602,8 @@ while [ $# -gt 0 ]; do
             exit 1 ;;
         --sources)
             [ $# -ge 2 ] || { log_err "--sources 需要音源列表参数"; exit 1; }
-            SOURCES_RAW="${2}"; shift 2 ;;
-        --sources=*) SOURCES_RAW="${1#*=}"; shift ;;
+            SOURCES_RAW="${2}"; SOURCES_EXPLICIT=1; shift 2 ;;
+        --sources=*) SOURCES_RAW="${1#*=}"; SOURCES_EXPLICIT=1; shift ;;
         --lx-source-url)
             [ $# -ge 2 ] || { log_err "--lx-source-url 需要 URL 参数"; exit 1; }
             LX_SOURCE_URL_CLI="${2}"; shift 2 ;;
@@ -573,7 +649,7 @@ run_docker() {
         local key
         local -a build_env=()
         for key in FNMUSIC_BUILD_FINGERPRINT FNMUSIC_BASE_IMAGE FNMUSIC_PIP_INDEX FNMUSIC_APT_MIRROR; do
-            if [[ -v "${key}" ]]; then
+            if [ -n "${!key+x}" ]; then
                 build_env+=("${key}=${!key}")
             fi
         done
@@ -1156,7 +1232,7 @@ mkdir -p "${BASE_DIR}/cache" "${BASE_DIR}/online_favorites" "${BASE_DIR}/playlis
 # 数据卷权限收紧：属主对齐容器 appuser（uid 1000，Dockerfile 固定），group/other 全收——
 # 网易 cookie/state.json 等凭据不可被本机其他用户读取；chown 需 root（fpk 安装即 root），
 # 交互安装时调用者本身即属主（fnOS 默认 admin=1000）兜底
-chown -R 1000:1000 "${SOURCES_DATA_DIR}" 2>/dev/null || true
+chown -R "${APP_UID}:${APP_GID}" "${SOURCES_DATA_DIR}" 2>/dev/null || true
 find "${SOURCES_DATA_DIR}" -type d -exec chmod 0700 {} + 2>/dev/null || true
 find "${SOURCES_DATA_DIR}" -type f -exec chmod 0600 {} + 2>/dev/null || true
 
@@ -1223,6 +1299,11 @@ ENV_DESIRED="$(mktemp)"
         # 显式平台选择：代理请求级白名单（短名）+ 容器级白名单（全名）
         echo "FNMUSIC_ONLINE_SOURCES='$(dotenv_escape "${MDL_PLATFORMS}")'"
         echo "MUSICDL_SOURCES='$(dotenv_escape "$(mdl_short_to_full "${MDL_PLATFORMS}")")'"
+    elif [ "${KEEP_SOURCES_FROM_ENV:-0}" -eq 1 ]; then
+        # 存量音源保留：musicdl 平台白名单也沿用 .env 既有值，不被默认重置
+        keep_env="${BASE_DIR:-}/.env"
+        echo "FNMUSIC_ONLINE_SOURCES='$(dotenv_escape "$(read_dotenv_value "${keep_env}" "FNMUSIC_ONLINE_SOURCES" | tr -d '[:space:]')")'"
+        echo "MUSICDL_SOURCES='$(dotenv_escape "$(read_dotenv_value "${keep_env}" "MUSICDL_SOURCES" | tr -d '[:space:]')")'"
     else
         echo "FNMUSIC_ONLINE_SOURCES='MiguMusicClient,KuwoMusicClient'"
     fi
@@ -1260,8 +1341,14 @@ ENV_DESIRED="$(mktemp)"
     echo "FNMUSIC_VERSION='${FNMUSIC_VERSION}'"
 } > "${ENV_DESIRED}"
 
-# 用户本次明确提供了新值的键（音源开关/WebUI/版本/部署模式为安装时部署选项，始终采用新值）
+# 用户本次明确提供了新值的键（音源开关/WebUI/版本/部署模式为安装时部署选项，始终采用新值）。
+# 例外：覆盖安装且存量 .env 已有音源配置（KEEP_SOURCES_FROM_ENV=1）时，三开关不进
+# explicit——env 合并按"非 explicit 键保留已有值"处理，音源选择以用户存量为准，
+# 向导默认值只影响全新安装。
 ENV_EXPLICIT="FNMUSIC_MUSICDL_ENABLED,FNMUSIC_NETEASE_ENABLED,FNMUSIC_LX_ENABLED,FNMUSIC_WEBUI_ENABLED,FNMUSIC_VERSION,FNMUSIC_DEPLOY_MODE,FNMUSIC_SEARCH_PROBE"
+if [ "${KEEP_SOURCES_FROM_ENV:-0}" -eq 1 ]; then
+    ENV_EXPLICIT="FNMUSIC_WEBUI_ENABLED,FNMUSIC_VERSION,FNMUSIC_DEPLOY_MODE,FNMUSIC_SEARCH_PROBE"
+fi
 if [ "${INTERNAL_TOKEN_GENERATED}" -eq 1 ]; then
     ENV_EXPLICIT="${ENV_EXPLICIT},FNMUSIC_INTERNAL_TOKEN"
 fi
@@ -1310,7 +1397,7 @@ else
     python3 "${BASE_DIR}/proxy/env_merge.py" \
         --existing /dev/null --desired "${ENV_DESIRED}" \
         --output "${ENV_PATH}" --explicit "${ENV_EXPLICIT}" --quiet
-    log_info "已生成初始配置 ${ENV_PATH} (chmod 600)。API Key 不会出现在日志中。"
+    log_info "已生成初始配置 ${ENV_PATH} (chmod 640)。API Key 不会出现在日志中。"
     log_install "mode=fresh-install version=${FNMUSIC_VERSION}"
 fi
 
@@ -1406,7 +1493,11 @@ PY
 migrate_lx_url_between_modes
 
 rm -f "${ENV_DESIRED}"
-chmod 600 "${ENV_PATH}"
+# 容器内 appuser 需按组读取 .env（0600 会让 entrypoint 认为未启用音源）
+chmod 0640 "${ENV_PATH}"
+chown ":${APP_GID:-1000}" "${ENV_PATH}" 2>/dev/null || true
+# 锁文件是跨进程同步身份，删除会让旧持锁者与新写入者锁住不同 inode。
+# 不在安装期间清理 .env.lock；备份权限由 WebUI 原子替换独立管理。
 
 # --- 代理 Python 环境 ---
 if ! command -v python3 >/dev/null 2>&1; then
@@ -1789,10 +1880,36 @@ lx_verify_and_activate() {
             --explicit "${explicit_keys}" --quiet
         rm -f "${ENV_DESIRED2}"
     fi
-    chmod 600 "${ENV_PATH}"
+    chmod 0640 "${ENV_PATH}"
+    chown ":${APP_GID:-1000}" "${ENV_PATH}" 2>/dev/null || true
     return 0
 }
 
+
+
+# Repo-internal directories writable by container/group
+for _d in recommend_cache online_favorites playlist_tracks play_history cache preview_image; do
+    if [ -d "${BASE_DIR}/$_d" ]; then
+        chown -R ":${APP_GID:-1000}" "${BASE_DIR}/$_d" 2>/dev/null || true
+        chmod 0770 "${BASE_DIR}/$_d" 2>/dev/null || true
+        find "${BASE_DIR}/$_d" -type d -exec chmod 0770 {} + 2>/dev/null || true
+        find "${BASE_DIR}/$_d" -type f -exec chmod 0660 {} + 2>/dev/null || true
+        setfacl -m "g::rwx" "${BASE_DIR}/$_d" 2>/dev/null || true
+    fi
+done
+for _f in album_registry.json llm_usage.json; do
+    if [ -f "${BASE_DIR}/$_f" ]; then
+        chown ":${APP_GID:-1000}" "${BASE_DIR}/$_f" 2>/dev/null || true
+        chmod 0660 "${BASE_DIR}/$_f" 2>/dev/null || true
+    fi
+done
+chown ":${APP_GID:-1000}" "${BASE_DIR}" 2>/dev/null || true
+chmod 0770 "${BASE_DIR}" 2>/dev/null || true
+# fnOS app center sets an ACL (user:fnmusic-ext:rwx) whose group:: entry is
+# r-x only; chmod 0770 only updates the mask, not group::. The container's
+# appuser (gid=APP_GID) needs group write to create files in /repo (e.g.
+# .env.merge.*, .env.lock, .env.webui.bak). Explicitly set group::rwx.
+setfacl -m "g::rwx" "${BASE_DIR}" 2>/dev/null || true
 
 takeover preflight --base "${BASE_DIR}"
 if [ "${DEPLOY_MODE:-docker}" = "native" ]; then

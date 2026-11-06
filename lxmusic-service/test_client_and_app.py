@@ -21,6 +21,176 @@ from lxserver_client import (
 )
 
 
+@pytest.mark.parametrize("error_type", [
+    httpx.ReadTimeout, httpx.ConnectError, httpx.RemoteProtocolError,
+])
+@pytest.mark.parametrize("operation", ["search", "resolve", "list", "import", "upload", "toggle"])
+def test_lxserver_transport_log_preserves_error_without_request(error_type, operation, caplog):
+    """HTTPX 的无 request 异常属性会抛 RuntimeError，日志不得覆盖原异常或重试。"""
+    from types import SimpleNamespace
+
+    client = LxServerClient(base_url="http://test", timeout=8.0)
+    error = error_type("private-error-url?token=private-token")
+    calls = []
+
+    async def fail(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise error
+
+    async def get_client():
+        return SimpleNamespace(get=fail, post=fail)
+
+    client.get_client = get_client
+    operations = {
+        "search": lambda: client.search("private-query"),
+        "resolve": lambda: client.get_music_url({"name": "private-song"}),
+        "list": client.list_custom_sources,
+        "import": lambda: client.import_custom_source("https://private-url/?token=private-token"),
+        "upload": lambda: client.upload_custom_source("private-file.js", "private-body"),
+        "toggle": lambda: client.toggle_custom_source("private-source", True),
+    }
+
+    async def run():
+        with pytest.raises(error_type) as caught:
+            await operations[operation]()
+        assert caught.value is error
+        assert getattr(caught.value, "result_unknown", False) is (
+            operation in ("import", "upload", "toggle"))
+
+    asyncio.run(run())
+    assert len(calls) == 1
+    records = [record for record in caplog.records if record.name == "fnmusic.lxserver"]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert f"operation={operation} error={error_type.__name__}" in message
+    assert "elapsed_s=" in message
+    assert f"budget_s={20.0 if operation in ('import', 'upload') else 8.0:.3f}" in message
+    assert "private" not in message
+    assert records[0].exc_info is None
+    if operation in ("import", "upload", "toggle"):
+        assert "result_unknown=True" in message
+
+
+def test_lxserver_transport_log_keeps_stage_without_credentials(caplog):
+    client = LxServerClient(base_url="http://test", admin_password="private-password")
+    request = httpx.Request("POST", "http://private-host/private-path?token=private-token",
+                            content="private-body", headers={"Authorization": "private-auth"})
+    error = httpx.RemoteProtocolError("private-error", request=request)
+
+    def handler(_request):
+        raise error
+
+    async def run():
+        client._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://test")
+        try:
+            with pytest.raises(httpx.RemoteProtocolError) as caught:
+                await client.upload_custom_source("private-name.js", "private-script")
+            assert caught.value is error
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+    assert "operation=upload error=RemoteProtocolError" in caplog.text
+    assert "elapsed_s=" in caplog.text
+    assert "budget_s=20.000" in caplog.text
+    assert "private" not in caplog.text
+
+
+@pytest.mark.parametrize("resolver_timeout", [8.0, 0.03, 32.0])
+def test_lxserver_management_budget_is_independent_of_resolver(resolver_timeout):
+    """全局客户端的 resolver=8s 不得截断管理初始化；搜索/取链预算不变。"""
+    captured = []
+    client = LxServerClient(base_url="http://test", timeout=resolver_timeout)
+    assert client.management_timeout == 20.0
+    assert client.management_timeout < 30.0  # WebUI 上传 HTTP 外层预算
+
+    def handler(request):
+        captured.append((request.url.path, request.extensions["timeout"]))
+        if request.url.path in ("/api/music/search", "/api/custom-source/list"):
+            return httpx.Response(200, json=[])
+        return httpx.Response(200, json={"success": True, "url": "https://media.test/a.mp3"})
+
+    async def run():
+        client._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://test")
+        try:
+            await client.import_custom_source("https://source.test/a.js")
+            await client.upload_custom_source("a.js", "script")
+            await client.search("song")
+            await client.get_music_url({"songmid": "1"})
+            await client.get_music_url({"songmid": "1"}, request_timeout=1.25)
+            await client.get_music_url({"songmid": "1"}, "128k", None, 2.5)
+            await client.list_custom_sources()
+            await client.toggle_custom_source("a.js", True)
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+    expected = [20.0, 20.0, resolver_timeout, resolver_timeout, 1.25, 2.5,
+                resolver_timeout, resolver_timeout]
+    assert len(captured) == len(expected)
+    for (_, timeout), budget in zip(captured, expected):
+        assert timeout == {phase: budget for phase in ("connect", "read", "write", "pool")}
+
+
+@pytest.mark.parametrize("operation", ["import", "upload"])
+def test_lxserver_management_total_deadline_does_not_replay(operation, caplog):
+    """即使传输持续不结束，也有总 deadline；超时只能报告结果未知，不能重放写请求。"""
+    client = LxServerClient(base_url="http://test", timeout=8.0)
+    client.management_timeout = 0.02
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        await asyncio.Event().wait()
+
+    async def run():
+        client._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://test")
+        try:
+            async with asyncio.timeout(1.0):
+                with pytest.raises(httpx.ReadTimeout, match="result unknown") as caught:
+                    if operation == "import":
+                        await client.import_custom_source("https://source.test/a.js")
+                    else:
+                        await client.upload_custom_source("a.js", "script")
+                assert caught.value.result_unknown is True
+            assert not client.mgmt_lock.locked()
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+    assert len(requests) == 1
+    assert f"operation={operation} error=ReadTimeout" in caplog.text
+    assert "budget_s=0.020 result_unknown=True" in caplog.text
+
+
+@pytest.mark.parametrize("positional", [False, True])
+def test_lxserver_resolve_log_uses_explicit_request_budget(positional, caplog):
+    client = LxServerClient(base_url="http://test", timeout=8.0)
+
+    def handler(request):
+        raise httpx.ReadTimeout("private-error", request=request)
+
+    async def run():
+        client._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://test")
+        try:
+            with pytest.raises(httpx.ReadTimeout):
+                if positional:
+                    await client.get_music_url({}, "128k", None, 1.25)
+                else:
+                    await client.get_music_url({}, request_timeout=1.25)
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+    assert "operation=resolve error=ReadTimeout" in caplog.text
+    assert "budget_s=1.250" in caplog.text
+    assert "private" not in caplog.text
+
+
 # ------------------------------------------------------------- 映射函数单测 --
 
 def test_normalize_source():
@@ -543,7 +713,9 @@ def test_track_lyric_endpoint(test_app_client):
     assert "[00:00.00]" in data["data"]["lyric"]
 
 
-def test_source_management_endpoints(test_app_client, fake_lx):
+def test_source_management_endpoints(test_app_client, fake_lx, tmp_path, monkeypatch):
+    source_dir = tmp_path / "lxserver"
+    monkeypatch.setattr(lxapp, "LXSERVER_DATA_DIR", source_dir.as_posix())
     # GET /api/v1/source
     res = test_app_client.get("/api/v1/source")
     assert res.status_code == 200
@@ -557,7 +729,7 @@ def test_source_management_endpoints(test_app_client, fake_lx):
     assert res.status_code == 200
     assert res.json()["ok"] is True
     data = res.json()["data"]
-    assert data["url"] == "file:///data/lxserver/users/source/_open/MyTest.js"
+    assert data["url"] == f"file://{source_dir.as_posix()}/users/source/_open/MyTest.js"
     assert data["meta"]["name"] == "MyTest"
 
     # 同一脚本重复上传：复用既有源，不报错（多源列表的常规操作）
@@ -776,8 +948,8 @@ def test_activation_list_503_returns_service_failure(test_app_client, fake_lx, m
 def test_lxserver_upload_sends_json_contract():
     """上传必须发 JSON {filename, content, allowUnsafeVM}（lxserver 端点 JSON.parse，multipart 会被拒）。
 
-    allowUnsafeVM=True 代答"原生 VM 模式"确认：聚合类脚本（pdone/lx-music-source
-    聚合API接口等）需要原生 VM，缺省确认文案会被服务端按 requireUnsafe 拒绝。"""
+    安全契约：第三方脚本不受信任，allowUnsafeVM 默认显式 false，不再代答
+    “原生 VM 模式”确认；需要 VM 的脚本按 unsafe_vm_required 明确报告。"""
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -791,12 +963,13 @@ def test_lxserver_upload_sends_json_contract():
     client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://test")
     res = asyncio.run(client.upload_custom_source("x.js", "console.log(1)"))
     assert captured["content_type"].startswith("application/json")
-    assert captured["body"] == {"filename": "x.js", "content": "console.log(1)", "allowUnsafeVM": True}
+    assert captured["body"] == {"filename": "x.js", "content": "console.log(1)",
+                                "allowUnsafeVM": False}
     assert res["id"] == "x.js"
 
 
 def test_lxserver_import_sends_allow_unsafe_vm():
-    """URL 导入同样携带 allowUnsafeVM=True（lxserver import 端点同款确认语义）。"""
+    """URL 导入同样默认 allowUnsafeVM=False，不自动授权不安全 VM。"""
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -808,7 +981,7 @@ def test_lxserver_import_sends_allow_unsafe_vm():
     client = LxServerClient(base_url="http://test", admin_password="pw")
     client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://test")
     res = asyncio.run(client.import_custom_source("https://example.com/src.js"))
-    assert captured["body"] == {"url": "https://example.com/src.js", "allowUnsafeVM": True}
+    assert captured["body"] == {"url": "https://example.com/src.js", "allowUnsafeVM": False}
     assert res["id"] == "imp.js"
 
 
@@ -868,7 +1041,9 @@ def test_track_url_resolution(test_app_client):
         assert data["ok"] is True
         assert data["data"]["id"] == "lx:kw:5886682"
         assert data["data"]["ext"] == "flac"
-        assert data["data"]["actual_tier"] == "lossless"
+        # type=flac 只是解析档回显，实际档没有实测证据
+        assert data["data"]["resolution_quality"] == "lossless"
+        assert data["data"]["actual_tier"] == ""
         assert "headers" in data["data"]
     finally:
         lxapp.app.state.client = orig_client
@@ -1041,6 +1216,20 @@ def test_source_set_http_url_activates_target(test_app_client, fake_lx):
     states = {s["id"]: s["enabled"] for s in fake_lx.sources}
     assert states.get("remote_source.js") is True
     assert states.get("source1") is True
+
+
+def test_source_set_reuses_matching_import_url_without_reimport(test_app_client, fake_lx):
+    """保存/启动恢复不得重复下载并临时执行相同 sourceUrl 的脚本。"""
+    url = "https://example.com/xinghai/latest.js"
+    res = test_app_client.post("/api/v1/source", json={"url": url})
+    assert res.status_code == 200
+    assert fake_lx.import_calls == [url]
+    for source in fake_lx.sources:
+        source["status"] = "success"
+    res = test_app_client.post("/api/v1/source", json={"url": url})
+    assert res.status_code == 200
+    assert res.json()["source_id"] == "latest.js"
+    assert fake_lx.import_calls == [url]
 
 
 def test_activate_nonexistent_source_does_not_disable_existing():
@@ -1501,16 +1690,16 @@ async def test_track_url_ttl_expiry_dead_url_reresolves(fake_lx, fresh_url_cache
 def test_track_url_negative_cache_and_fresh_bypass(test_app_client, fresh_url_cache, fake_lx):
     """解析失败写负缓存：短时间内重复请求不再打音源；fresh=1 旁路强制重新解析。
 
-    一次失败解析会走完整音质阶梯（flac→320k→128k 共 3 次调低档调用）。"""
+    一次失败解析会走完整七档阶梯中的四档（flac→320k→192k→128k）。"""
     fake_lx.url_result = None
     r1 = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless")
     r2 = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless")
     assert r1.status_code == 404 and r2.status_code == 404
-    assert len(fake_lx.url_calls) == 3  # 第二次请求负缓存命中，未再走阶梯
+    assert len(fake_lx.url_calls) == 4  # 第二次请求负缓存命中，未再走阶梯
 
     r3 = test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless&fresh=1")
     assert r3.status_code == 404
-    assert len(fake_lx.url_calls) == 6  # fresh 旁路负缓存，重新走一遍阶梯
+    assert len(fake_lx.url_calls) == 8  # fresh 旁路负缓存，重新走一遍阶梯
 
     # 音源恢复后 fresh 重取成功并覆盖负缓存，后续请求恢复命中
     fake_lx.url_result = {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "test"}
@@ -1523,7 +1712,7 @@ def test_track_url_negative_cache_and_fresh_bypass(test_app_client, fresh_url_ca
         assert r5.status_code == 200
     finally:
         lxapp.app.state.client = orig_client
-    assert len(fake_lx.url_calls) == 7  # 成功解析在首档即命中，仅 +1
+    assert len(fake_lx.url_calls) == 9  # 成功解析在首档即命中，仅 +1
 
 
 def _ua_gated_cdn_handler(request: httpx.Request) -> httpx.Response:
@@ -1574,28 +1763,29 @@ async def test_track_url_refresh_backfills_ua(fake_lx, fresh_url_cache):
 
 @pytest.mark.asyncio
 async def test_circuit_breaker_scoped_per_platform(fake_lx, fresh_url_cache):
-    """平台级熔断：tx 连续失败只熔断 tx，kw 解析不受牵连。
+    """脚本+平台级熔断：tx 上的脚本连续失败只熔断该脚本/tx，kw 解析不受牵连。
 
     2026-10-10 回归：全局 user_source 熔断下 tx/mg 第三方源故障（tx 只产出加密
     mflac、mg 后端全挂）连累 kw/kg/wy 全平台 404，表现为"几乎所有洛雪曲目不可播"。"""
     probe_client = mock_client(_flac_probe_handler)
     fake_lx.url_result = None
+    fake_lx.sources[0]["supportedSources"] = ["kw", "kg", "wy", "tx"]
     try:
-        # 3 首不同 tx 曲目各失败一次（同曲会命中失败负缓存不再打音源）→ 触发 tx 平台熔断
+        # 3 首不同 tx 曲目各失败一次（同曲会命中失败负缓存不再打音源）→ 触发该脚本 tx 熔断
         for i, songmid in enumerate(["001abc", "002def", "003ghi"]):
             r = await lxapp._resolve_url_cached(
                 probe_client, "tx", {"id": f"lx:tx:{songmid}", "lx_source": "tx"}, "lossless", 20.0)
             assert r is None
         tx_calls = len(fake_lx.url_calls)
-        assert tx_calls == 9  # 3 次解析 × 完整音质阶梯 3 档
+        assert tx_calls == 12  # 3 次解析 × 七档阶梯中的四档（flac/320k/192k/128k）
 
-        # 第 4 首 tx 曲目被平台熔断直接跳过：不再消耗音源调用
+        # 第 4 首 tx 曲目被该脚本+平台熔断直接跳过：不再消耗音源调用
         r4 = await lxapp._resolve_url_cached(
             probe_client, "tx", {"id": "lx:tx:004jkl", "lx_source": "tx"}, "lossless", 20.0)
         assert r4 is None
         assert len(fake_lx.url_calls) == tx_calls
 
-        # kw 不受 tx 熔断影响，正常解析成功
+        # kw 是不同平台、不同熔断键，不受 tx 脚本熔断影响，正常解析成功
         fake_lx.url_result = {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "test"}
         rw = await lxapp._resolve_url_cached(
             probe_client, "kw", {"id": "lx:kw:5886682", "lx_source": "kw"}, "lossless", 20.0)
@@ -1608,8 +1798,14 @@ async def test_circuit_breaker_scoped_per_platform(fake_lx, fresh_url_cache):
 
 @pytest.mark.asyncio
 async def test_probe_reject_rotates_to_next_source(fake_lx, fresh_url_cache):
-    """同档直链探活失败：excludeApiSources 排除产出坏链的脚本换下一个激活源重试。"""
+    """同档直链探活失败：excludeApiSources 排除当前脚本后换下一个就绪脚本重试。"""
     probe_client = mock_client(_flac_probe_handler)
+    fake_lx.sources = [
+        {"id": "bad.js", "name": "坏链源", "enabled": True, "status": "success",
+         "supportedSources": ["kw"]},
+        {"id": "good.js", "name": "好链源", "enabled": True, "status": "success",
+         "supportedSources": ["kw"]},
+    ]
     fake_lx.url_script = [
         {"url": "https://media.test/dead.flac", "type": "flac",
          "sourceName": "坏链源", "sourceId": "bad.js", "hasMoreSources": True},
@@ -1620,8 +1816,8 @@ async def test_probe_reject_rotates_to_next_source(fake_lx, fresh_url_cache):
         r = await lxapp._resolve_url_cached(
             probe_client, "kw", {"id": "lx:kw:5886682", "lx_source": "kw"}, "lossless", 20.0)
         assert r and r["url"] == "https://media.test/song.flac"
-        # 第 2 次调用排除了第 1 个产出坏链的脚本（name 与 id 都传，lxserver 按二者过滤）
-        assert fake_lx.url_excludes == [None, ["bad.js", "坏链源"]]
+        # 每次请求都排除其他脚本的稳定 ID，把上游自动切换固定到当前脚本
+        assert fake_lx.url_excludes == [["good.js"], ["bad.js"]]
     finally:
         await probe_client.aclose()
         fake_lx.url_script.clear()
@@ -1634,8 +1830,9 @@ async def test_probe_reject_no_more_sources_falls_to_next_tier(fake_lx, fresh_ur
     # 每档都返回探活失败且无更多源；脚本标识不重复计数（tried 已全在 excluded 时停止）
     fake_lx.url_script = [
         {"url": "https://media.test/dead.flac", "type": "flac",
-         "sourceName": "唯一源", "sourceId": "only.js", "hasMoreSources": False},
-        {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "唯一源"},
+         "sourceName": "唯一源", "sourceId": "source1", "hasMoreSources": False},
+        {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "唯一源",
+         "sourceId": "source1"},
     ]
     try:
         r = await lxapp._resolve_url_cached(
@@ -1652,15 +1849,22 @@ async def test_probe_reject_no_more_sources_falls_to_next_tier(fake_lx, fresh_ur
 async def test_empty_url_response_rotates_to_next_source(fake_lx, fresh_url_cache):
     """脚本"成功"却拿不出直链（200 无 url，如平台未激活的静默空返回）：同档换源重试。"""
     probe_client = mock_client(_flac_probe_handler)
+    fake_lx.sources = [
+        {"id": "empty.js", "name": "空手源", "enabled": True, "status": "success",
+         "supportedSources": ["kg"]},
+        {"id": "good.js", "name": "好链源", "enabled": True, "status": "success",
+         "supportedSources": ["kg"]},
+    ]
     fake_lx.url_script = [
         {"type": "flac", "sourceName": "空手源", "sourceId": "empty.js", "hasMoreSources": True},
-        {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "好链源"},
+        {"url": "https://media.test/song.flac", "type": "flac", "sourceName": "好链源",
+         "sourceId": "good.js"},
     ]
     try:
         r = await lxapp._resolve_url_cached(
             probe_client, "kg", {"id": "lx:kg:abc123", "lx_source": "kg"}, "lossless", 20.0)
         assert r and r["url"] == "https://media.test/song.flac"
-        assert fake_lx.url_excludes == [None, ["empty.js", "空手源"]]
+        assert fake_lx.url_excludes == [["good.js"], ["empty.js"]]
     finally:
         await probe_client.aclose()
         fake_lx.url_script.clear()
@@ -1683,8 +1887,17 @@ def test_chain_half_open_stuck_guard(fresh_url_cache):
 
 def test_track_url_quality_isolation(test_app_client, fresh_url_cache, fake_lx):
     """不同音质档各自解析与缓存，同音质命中缓存（音质变化不串缓存）。"""
+    fake_lx.url_script = [
+        {"url": "https://media.test/song.flac", "type": "flac", "sourceId": "source1"},
+        {"url": "https://media.test/song.mp3", "type": "320k", "sourceId": "source1"},
+    ]
+    def media(request):
+        if request.url.path.endswith('.mp3'):
+            return httpx.Response(206, content=b'\xff\xfb\x90\x44' + b'\x00' * 4096,
+                                  headers={'Content-Type': 'audio/mpeg'})
+        return _flac_probe_handler(request)
     orig_client = lxapp.app.state.client
-    lxapp.app.state.client = mock_client(_flac_probe_handler)
+    lxapp.app.state.client = mock_client(media)
     try:
         assert test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless").status_code == 200
         assert test_app_client.get("/api/v1/track/url?id=lx:kw:5886682&quality=lossless").status_code == 200
@@ -1947,8 +2160,11 @@ def test_songinfo_store_capacity_eviction(tmp_path):
 
 
 def _install_probe_client():
-    """替换探活 client 为 Range 206 fLaC 应答（与 test_track_url_resolution 同款）。"""
+    """按夹具媒体格式返回Range 206前缀，不把MP3请求伪装为FLAC。"""
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith('.mp3'):
+            return httpx.Response(206, content=b'\xff\xfb\x90\x44' + b'\x00' * 4096,
+                                  headers={'Content-Type': 'audio/mpeg'})
         return httpx.Response(
             206,
             headers={"Content-Type": "audio/flac", "Content-Range": "bytes 0-4095/30000000"},
@@ -1970,9 +2186,11 @@ def _install_probe_client():
 def _spy_get_music_url(fake_lx, seen):
     original = fake_lx.get_music_url
 
-    async def spy(song_info, quality="128k", exclude_api_sources=None, request_timeout=None):
+    async def spy(song_info, quality="128k", exclude_api_sources=None, request_timeout=None,
+                  auto_switch_api_source=True):
         seen.append(dict(song_info))
-        return await original(song_info, quality, exclude_api_sources, request_timeout)
+        return await original(song_info, quality, exclude_api_sources, request_timeout,
+                              auto_switch_api_source)
 
     fake_lx.get_music_url = spy
 
@@ -1986,7 +2204,7 @@ def test_track_url_meta_params_synthesize_and_writeback(test_app_client, fake_lx
     try:
         res = test_app_client.get(
             "/api/v1/track/url",
-            params={"id": "lx:kw:999001", "quality": "standard",
+            params={"id": "lx:kw:999001", "quality": "lossless",
                     "title": "晴天", "artist": "周杰伦", "album": "叶惠美",
                     "duration": 269.3, "cover": "https://img.test/x.jpg"},
         )
@@ -2008,7 +2226,7 @@ def test_track_url_cold_without_meta_falls_back_unknown(test_app_client, fake_lx
     _spy_get_music_url(fake_lx, seen)
     restore_client = _install_probe_client()
     try:
-        res = test_app_client.get("/api/v1/track/url", params={"id": "lx:kw:999002", "quality": "standard"})
+        res = test_app_client.get("/api/v1/track/url", params={"id": "lx:kw:999002", "quality": "lossless"})
     finally:
         restore_client()
     assert res.status_code == 200
@@ -2026,7 +2244,7 @@ def test_track_url_cached_songinfo_not_overridden_by_meta(test_app_client, fake_
     try:
         res = test_app_client.get(
             "/api/v1/track/url",
-            params={"id": "lx:kw:999003", "quality": "standard", "title": "假名", "artist": "假歌手"},
+            params={"id": "lx:kw:999003", "quality": "lossless", "title": "假名", "artist": "假歌手"},
         )
     finally:
         restore_client()
@@ -2124,10 +2342,11 @@ def test_lx_timeouts_hot_reload_clears_negative_cache_and_circuit_breaker(tmp_pa
 @pytest.mark.anyio
 async def test_slow_source_exceeds_default_resolver_timeout_then_succeeds_with_enlarged_timeout(fake_lx, monkeypatch, fresh_url_cache):
     """慢源解析超时保护：超出单次解析超时放弃/接力，调大参数后成功取链。"""
-    async def slow_get_music_url(song_info, quality="128k", exclude_api_sources=None, request_timeout=None):
+    async def slow_get_music_url(song_info, quality="128k", exclude_api_sources=None,
+                                 request_timeout=None, auto_switch_api_source=True):
         fake_lx.url_timeouts.append(request_timeout)
         await asyncio.sleep(0.1)
-        return {"url": "https://media.test/slow.mp3", "type": "128k"}
+        return {"url": "https://media.test/slow.mp3", "type": "128k", "sourceId": "source1"}
 
     monkeypatch.setattr(fake_lx, "get_music_url", slow_get_music_url)
 
@@ -2146,6 +2365,10 @@ async def test_slow_source_exceeds_default_resolver_timeout_then_succeeds_with_e
         budget=1.0, resolver_timeout=0.03, probe_timeout=0.5,
     )
     assert res1 is None
+    # A timed-out tier is suppressed for 30 seconds; test the next probe after
+    # that independent cooldown has expired.
+    for key in lxapp._RESOLVE_TIMEOUT_COOLDOWN:
+        lxapp._RESOLVE_TIMEOUT_COOLDOWN[key] = 0
     assert fake_lx.url_timeouts[-1] == 0.03
 
     # 2. 调大 resolver_timeout 到 0.5s（大于 0.1s），成功返回
@@ -2163,6 +2386,7 @@ def test_track_url_endpoint_uses_hot_reloaded_timeouts(test_app_client, fake_lx,
     env_file = tmp_path / ".env"
     env_file.write_text("LX_RESOLVER_TIMEOUT=11.5\nLX_URL_TIMEOUT=22.0\nLX_PROBE_TIMEOUT=4.5\n", encoding="utf-8")
     monkeypatch.setenv("LX_ENV_PATH", str(env_file))
+    fake_lx.url_result = {"url": "https://media.test/song.mp3", "type": "128k", "sourceId": "source1"}
 
     restore = _install_probe_client()
     try:

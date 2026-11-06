@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import logging
@@ -30,7 +31,7 @@ from pathlib import Path
 import anyio
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
@@ -53,6 +54,13 @@ from proxy.fnlog import (  # noqa: E402
 )
 from proxy import llm_usage  # noqa: E402  # 每日大模型 token 账本（纯 stdlib）
 from proxy import publicplaylists as pubpl
+from proxy.quality_policy import (  # noqa: E402
+    QUALITY_LEVELS,
+    effective_download_quality,
+    effective_play_quality,
+    normalize_quality,
+    quality_migration,
+)
 from proxy.version import read_release_channel, ui_version
 
 logger = logging.getLogger("webui_service")
@@ -72,8 +80,49 @@ CONF = {
 }
 
 ENV_PATH = Path(CONF["repo_dir"]) / ".env"
+
+MAINTENANCE_SOCKET = "/run/fnmusic-ext/maintenance.sock"
+
+async def _try_maintenance_socket(method: str, path: str, body: dict | None = None) -> dict | JSONResponse | None:
+    """Try to call the host maintenance socket directly (for direct-mode access).
+
+    Returns JSON on success, an error response preserving the host status,
+    or None when the socket is unavailable (caller should fall back to 501).
+    """
+    if not os.path.exists(MAINTENANCE_SOCKET):
+        return None
+    try:
+        transport = httpx.AsyncHTTPTransport(uds=MAINTENANCE_SOCKET)
+        async with httpx.AsyncClient(transport=transport, base_url="http://unix", timeout=35.0) as client:
+            if method == "GET":
+                resp = await client.get(path)
+            else:
+                resp = await client.post(path, json=body or {})
+            payload = _resp_json(resp)
+            if 200 <= resp.status_code < 300:
+                return payload
+            # 保留宿主门禁/忙状态等真实错误，不能伪装成 socket 不可用。
+            return JSONResponse(content=payload, status_code=resp.status_code)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 VERSION_PATH = Path(CONF["repo_dir"]) / "VERSION"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+
+def _static_build_id() -> str:
+    """以 HTML、JS、CSS 内容生成指纹，区分缓存错配和后端 Schema 版本。"""
+    digest = hashlib.sha256()
+    for filename in ("index.html", "app.js", "style.css"):
+        digest.update(filename.encode("utf-8"))
+        try:
+            digest.update((STATIC_DIR / filename).read_bytes())
+        except OSError:
+            digest.update(b"missing")
+    return digest.hexdigest()[:16]
+
+
+STATIC_BUILD_ID = _static_build_id()
 
 # ------------------------------------------------------------------ 检查更新 --
 # 双源顺序即回退顺序：优先 GitHub Releases，被墙/限流/超时等失败时回退 Gitee。
@@ -105,6 +154,9 @@ PROVIDERS = {
     "lxmusic": "FNMUSIC_LX_ENABLED",
 }
 
+# #98：仅兼容旧客户端仍会提交的退休键；不进入公开配置 Schema。
+RETIRED_CONFIG_KEYS = frozenset({"FNMUSIC_SEARCH_PROBE"})
+
 # WebUI 可管理的配置键与元数据（kind/default/reload 驱动前端渲染与校验）。
 # reload: hot=proxy 热重载即生效；process=需要切换/重启对应音源进程。
 SCHEMA: dict[str, dict] = {
@@ -118,12 +170,15 @@ SCHEMA: dict[str, dict] = {
     "MUSICDL_SOURCES": {"kind": "csv", "default": "", "group": "musicdl", "reload": "process", "label": "musicdl 服务白名单（联动）"},
     "LX_SOURCE_URL": {"kind": "str", "default": "", "group": "lx", "reload": "process", "label": "洛雪源脚本地址（http(s) URL 或 file:// 上传地址）"},
     "LX_SOURCE_LIST": {"kind": "str", "default": "[]", "group": "lx", "reload": "hot", "label": "洛雪源列表（JSON 数组）"},
+    "FNMUSIC_LX_AUTO_SWITCH": {"kind": "bool", "default": "true", "group": "lx_policy", "reload": "hot", "label": "洛雪自动切源"},
+    "FNMUSIC_LX_PLATFORM_PREFERRED": {"kind": "bool", "default": "false", "group": "lx_policy", "reload": "hot", "label": "洛雪跨平台优选"},
+    "FNMUSIC_LX_SOURCE_ORDER": {"kind": "source_order", "default": "[]", "group": "lx_policy", "reload": "hot", "label": "洛雪源顺序（稳定 ID JSON 数组）"},
     "LX_SOURCES": {"kind": "csv", "default": "kg,wy,mg,kw", "group": "lx", "reload": "hot", "label": "lx 平台（按源声明推导）"},
     "LX_RESOLVER_TIMEOUT": {"kind": "float", "default": "8.0", "min": 1, "max": 300, "step": "any", "group": "lx", "reload": "hot", "label": "单次解析超时（秒）"},
     "LX_URL_TIMEOUT": {"kind": "float", "default": "15.0", "min": 1, "max": 300, "step": "any", "group": "lx", "reload": "hot", "label": "取链总超时（秒）"},
     "LX_PROBE_TIMEOUT": {"kind": "float", "default": "3.0", "min": 1, "max": 300, "step": "any", "group": "lx", "reload": "hot", "label": "直链探活超时（秒）"},
-    "FNMUSIC_QUALITY_MODE": {"kind": "enum", "values": ["high", "balanced", "smooth"], "default": "high", "group": "quality", "reload": "hot", "label": "音质偏好"},
-    "FNMUSIC_DL_QUALITY": {"kind": "enum", "values": ["app", "original", "standard"], "default": "app", "group": "quality", "reload": "hot", "label": "APP下载音质"},
+    "FNMUSIC_PLAY_QUALITY": {"kind": "enum", "values": list(QUALITY_LEVELS), "default": "lossless", "group": "quality", "reload": "hot", "label": "在线播放音质"},
+    "FNMUSIC_DOWNLOAD_QUALITY": {"kind": "enum", "values": ["app", *QUALITY_LEVELS], "default": "app", "group": "quality", "reload": "hot", "label": "APP下载音质"},
     "FNMUSIC_RECOMMEND_HOT": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "热门榜单推荐"},
     "FNMUSIC_RECOMMEND_DAILY": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "每日推荐"},
     "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED": {"kind": "bool", "default": "false", "group": "recommend", "reload": "hot", "label": "公共歌单"},
@@ -141,6 +196,8 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_OFFICIAL_BIND_TIMEOUT_S": {"kind": "int", "default": "120", "min": 10, "max": 3600, "group": "tee", "reload": "hot", "label": "官方绑定等待（秒）"},
     "FNMUSIC_TEE_HANDOFF_MAX": {"kind": "int", "default": "3", "min": 0, "max": 20, "group": "tee", "reload": "hot", "label": "切歌续传并行数"},
     "FNMUSIC_LIBRARY_SCAN_PATH": {"kind": "str", "default": "", "group": "tee", "reload": "hot", "label": "曲库重扫接口（选填）"},
+    "FNMUSIC_SCAN_DELAY_S": {"kind": "float", "default": "3", "min": 0, "max": 600, "clamp": True, "step": "0.5", "group": "tee", "reload": "hot", "label": "落盘后延迟（秒）"},
+    "FNMUSIC_SCAN_COOLDOWN_S": {"kind": "float", "default": "90", "min": 0, "max": 3600, "clamp": True, "step": "0.5", "group": "tee", "reload": "hot", "label": "扫描冷却窗口（秒）"},
     "FNMUSIC_LLM_BASE_URL": {"kind": "str", "default": "", "group": "llm", "reload": "hot", "label": "OpenAI 兼容 Base URL"},
     "FNMUSIC_LLM_API_KEY": {"kind": "secret", "default": "", "group": "llm", "reload": "hot", "label": "API Key"},
     "FNMUSIC_LLM_MODEL": {"kind": "str", "default": "gpt-4o-mini", "group": "llm", "reload": "hot", "label": "模型"},
@@ -207,8 +264,9 @@ def _write_env_unlocked(updates: dict[str, str]) -> list[str]:
         # with_suffix 会把 ".env" 当后缀替换，产出 ".env.env.webui.bak" 畸形名；拼名字才是 /repo/.env.webui.bak
         backup = ENV_PATH.with_name(ENV_PATH.name + ".webui.bak")
         try:
-            backup.write_bytes(ENV_PATH.read_bytes())
-            os.chmod(backup, 0o600)  # write_bytes 按 umask 落盘（0644），密钥备份必须收紧
+            # 使用私有临时文件再原子替换，写入期间也不能暴露密钥；旧备份
+            # 不可写时无需先 unlink，失败仍保留旧备份且不阻断配置保存。
+            write_env_atomic(backup, ENV_PATH.read_text(encoding="utf-8"), mode=0o600)
         except OSError as exc:  # 备份失败不阻断写入，但要有迹可循
             logger.warning("webui env backup failed: %s", exc)
     merged = [(k, updates.get(k, v)) if k in updates else (k, v) for k, v in existing_kv]
@@ -718,7 +776,12 @@ def _normalize_lx_source_list(raw) -> str:
 
         name = str(item.get("name") or "").strip()
         name = re.sub(r"[\r\n\t]+", " ", name).strip()[:80]
-        normalized.append({"name": name, "url": url, "active": bool(item.get("active"))})
+        normalized_item = {"name": name, "url": url, "active": bool(item.get("active"))}
+        # 仅持久化 lxserver 返回的稳定 ID，不从显示名称推断身份。
+        source_id = str(item.get("id") or item.get("source_id") or "").strip()
+        if source_id and len(source_id) <= 256 and not any(ord(char) < 32 for char in source_id):
+            normalized_item["id"] = source_id
+        normalized.append(normalized_item)
 
     return json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
 
@@ -842,9 +905,39 @@ def _is_dir_within(child: str, parent: str) -> bool:
     return child == parent or child.startswith(parent.rstrip("/") + "/")
 
 
+def _normalize_lx_source_order(raw) -> str:
+    """验证稳定源 ID 顺序，保留输入顺序并统一为紧凑 JSON。"""
+    if isinstance(raw, str):
+        try:
+            values = json.loads(raw or "[]")
+        except Exception as exc:
+            raise ValueError(f"FNMUSIC_LX_SOURCE_ORDER: 不是合法 JSON 数组: {exc}") from exc
+    else:
+        values = raw
+    if not isinstance(values, list):
+        raise ValueError("FNMUSIC_LX_SOURCE_ORDER: 期望稳定源 ID 数组")
+    if len(values) > 50:
+        raise ValueError("FNMUSIC_LX_SOURCE_ORDER: 最多支持 50 个源")
+    source_ids: list[str] = []
+    seen: set[str] = set()
+    for raw_id in values:
+        if not isinstance(raw_id, str):
+            raise ValueError("FNMUSIC_LX_SOURCE_ORDER: 源 ID 必须是字符串")
+        source_id = raw_id.strip()
+        if not source_id or len(source_id) > 256 or any(ord(char) < 32 for char in source_id):
+            raise ValueError("FNMUSIC_LX_SOURCE_ORDER: 源 ID 为空、过长或包含控制字符")
+        if source_id in seen:
+            raise ValueError(f"FNMUSIC_LX_SOURCE_ORDER: 源 ID 重复: {source_id}")
+        source_ids.append(source_id)
+        seen.add(source_id)
+    return json.dumps(source_ids, ensure_ascii=False, separators=(",", ":"))
+
+
 def _normalize_value(key: str, raw) -> str:
     if key == "LX_SOURCE_LIST":
         return _normalize_lx_source_list(raw)
+    if key == "FNMUSIC_LX_SOURCE_ORDER":
+        return _normalize_lx_source_order(raw)
     spec = SCHEMA[key]
     kind = spec["kind"]
     if kind == "dir":
@@ -883,6 +976,9 @@ def _normalize_value(key: str, raw) -> str:
             raise ValueError(f"{key}: 期望数字，收到 {raw!r}") from exc
         if not math.isfinite(num):
             raise ValueError(f"{key}: 期望有限数字")
+        if spec.get("clamp"):
+            num = max(float(spec.get("min", num)), min(float(spec.get("max", num)), num))
+            return str(int(num)) if num.is_integer() else str(num)
         if num < float(spec.get("min", num)) or num > float(spec.get("max", num)):
             raise ValueError(f"{key}: 超出允许范围")
         return str(num)
@@ -905,14 +1001,71 @@ def _normalize_value(key: str, raw) -> str:
     return str(raw).strip()
 
 
+def _translate_legacy_quality(values: dict, existing: dict[str, str]) -> dict[str, str]:
+    """把旧客户端提交转换到新音质键；新旧值不一致时拒绝本次原子写入。"""
+    translations: dict[str, str] = {}
+    final_context = dict(existing)
+    final_context.update(values)
+    pairs = (
+        ("FNMUSIC_QUALITY_MODE", "FNMUSIC_PLAY_QUALITY", {"high", "balanced", "smooth"},
+         effective_play_quality, normalize_quality),
+        ("FNMUSIC_DL_QUALITY", "FNMUSIC_DOWNLOAD_QUALITY", {"app", "original", "standard"},
+         effective_download_quality, None),
+    )
+    for old_key, new_key, allowed, effective, normalizer in pairs:
+        if old_key not in values:
+            continue
+        legacy = str(values[old_key] or "").strip().lower()
+        if legacy not in allowed:
+            raise ValueError(f"{old_key}: 可选值 {'/'.join(sorted(allowed))}，收到 {values[old_key]!r}")
+        legacy_context = dict(final_context)
+        legacy_context[old_key] = legacy
+        legacy_context.pop(new_key, None)
+        converted = effective(legacy_context)
+        if new_key == "FNMUSIC_DOWNLOAD_QUALITY" and converted not in {"app", *QUALITY_LEVELS}:
+            raise ValueError(f"{old_key}: 无法转换为新的下载音质")
+
+        # 新键优先，但同一请求或已有新配置与旧值冲突时不猜测用户意图。
+        candidate_new = values.get(new_key, existing.get(new_key))
+        if candidate_new not in (None, ""):
+            if new_key == "FNMUSIC_DOWNLOAD_QUALITY":
+                normalized_new = "app" if str(candidate_new).strip().lower() == "app" else normalize_quality(candidate_new, default=None)
+            else:
+                normalized_new = normalize_quality(candidate_new, default=None)
+            if normalized_new != converted:
+                raise ValueError(f"{old_key} 与 {new_key} 冲突，请只提交一致的音质设置")
+            translations[new_key] = normalized_new
+        else:
+            translations[new_key] = converted
+    return translations
+
+
 def validate_updates(values: dict) -> dict[str, str]:
+    values = dict(values or {})
+    existing = read_env()
+    legacy_updates = _translate_legacy_quality(values, existing)
     updates: dict[str, str] = {}
-    for key, raw in (values or {}).items():
+    for key, raw in values.items():
+        if key in ("FNMUSIC_QUALITY_MODE", "FNMUSIC_DL_QUALITY"):
+            continue
         if key not in SCHEMA:
             raise ValueError(f"不支持的配置键: {key}")
         updates[key] = _normalize_value(key, raw)
+    updates.update(legacy_updates)
+    if "LX_SOURCE_LIST" in updates:
+        old_ids = {str(item.get("id") or item.get("source_id") or "").strip()
+                   for item in _lx_list_items(existing.get("LX_SOURCE_LIST"))}
+        new_ids = {str(item.get("id") or item.get("source_id") or "").strip()
+                   for item in _lx_list_items(updates["LX_SOURCE_LIST"])}
+        removed_ids = old_ids - new_ids - {""}
+        if removed_ids:
+            order_raw = updates.get("FNMUSIC_LX_SOURCE_ORDER", existing.get("FNMUSIC_LX_SOURCE_ORDER", "[]"))
+            order_ids = json.loads(_normalize_lx_source_order(order_raw))
+            updates["FNMUSIC_LX_SOURCE_ORDER"] = json.dumps(
+                [source_id for source_id in order_ids if source_id not in removed_ids],
+                ensure_ascii=False, separators=(",", ":"))
     # 三选一互斥：以"应用后的最终状态"判断
-    final = dict(read_env())
+    final = dict(existing)
     final.update(updates)
     # 储存目录互斥：缓存目录与下载目录不能相同或互为父子（否则滚动缓存被官方扫描进曲库）
     if updates.keys() & {"FNMUSIC_CACHE_DIR", "FNMUSIC_TEE_SAVE_DIR"}:
@@ -1033,9 +1186,14 @@ def _resp_json(resp: httpx.Response) -> dict:
     """防御性解析同容器服务的响应体：上游裸 500 等非 JSON 文本时返回带 error 的
     字典而不是抛 JSONDecodeError（否则自身也会 500，用户只能看到 "HTTP 500"）。"""
     try:
-        return resp.json() if resp.content else {}
+        data = resp.json() if resp.content else {}
     except Exception:  # noqa: BLE001
         return {"ok": False, "error": f"上游返回非 JSON 响应（HTTP {resp.status_code}）"}
+    # 调用方按对象读取状态字段；数组、null 和标量不能使诊断接口再次报错。
+    # 不回显异常正文，避免把源脚本可能携带的凭据送入诊断响应。
+    if not isinstance(data, dict):
+        return {"ok": False, "error": f"上游返回非 JSON 对象（HTTP {resp.status_code}）"}
+    return data
 
 
 async def _fetch_json(request: Request, url: str, *, timeout: float = 4.0) -> "tuple[bool, dict]":
@@ -1155,38 +1313,215 @@ def _is_admin(headers: dict[str, str]) -> bool:
     return headers.get("x-trim-isadmin", "").lower() == "true"
 
 
+# ---------------------------------------------------------------- 分段健康 --
+# issue #108 现场：supervisor 报告 lxserver/lxmusic 两个进程都 RUNNING，但
+# lxmusic 查询 lxserver 持续 TimeoutError。旧模型只有 reachable=true/false，
+# 把「进程活着但不响应」和「服务正常」混在一起，异常类型也丢掉了。
+# 这里把健康拆成五层，每层单独出结论，异常保留类型：
+#   process 进程层（supervisor 状态）
+#   http    HTTP 层（/healthz 是否应答）
+#   list    源列表层（能否取到音源列表快照）
+#   script  脚本层（自定义源初始化是否成功）
+#   playback 播放层（健康查询不请求媒体，实际播放保持未测）
+# 分层后 RUNNING + TimeoutError 会落在 http.error_type=timeout 上，排障时不再需要猜。
+HEALTH_HTTP_TIMEOUT = 4.0
+# 进程层失败时不隐瞒 HTTP 层：标记未探活而非复用旧结论。
+_NOT_PROBED = {"ok": False, "error_type": "not_probed", "detail": "进程未运行，未探活"}
+
+
+def _http_error_layer(exc: BaseException) -> "tuple[str, str]":
+    """把 HTTP 异常映射成稳定的错误类型 + 脱敏细节。
+
+    超时、连接失败、协议错误必须分开：#108 的 TimeoutError 不应当和
+    「端口没监听」的 ConnectError 假装成同一回事。
+    """
+    if isinstance(exc, (httpx.TimeoutException, TimeoutError)):
+        return "timeout", str(exc) or exc.__class__.__name__
+    if isinstance(exc, httpx.ConnectError):
+        return "connect", str(exc) or exc.__class__.__name__
+    if isinstance(exc, httpx.RemoteProtocolError):
+        return "protocol", str(exc) or exc.__class__.__name__
+    if isinstance(exc, httpx.HTTPError):
+        return "http_error", str(exc) or exc.__class__.__name__
+    return type(exc).__name__, str(exc) or exc.__class__.__name__
+
+
+async def _probe_http_layer(request: Request, url: str,
+                            *, timeout: float = HEALTH_HTTP_TIMEOUT) -> dict:
+    """HTTP 就绪层探活：成功与否都返回字典，异常类型保留在 error_type。
+
+    连接阶段单独给较短上限：目标端口没监听时 ConnectError 应当很快返回，
+    不能让整层健康检查卡在默认的 5 秒连接超时上。
+    """
+    client = get_http(request)
+    budget = httpx.Timeout(timeout, connect=min(2.0, timeout))
+    try:
+        resp = await asyncio.wait_for(client.get(url, timeout=budget), timeout=max(0.01, timeout))
+    except Exception as exc:  # noqa: BLE001  # 探活失败即结论，不是异常
+        error_type, detail = _http_error_layer(exc)
+        return {"ok": False, "error_type": error_type,
+                "detail": " ".join(redact(detail).split())[:240]}
+    data = _resp_json(resp)
+    # 共享解析器已经校验 JSON 对象；空响应仍不能证明服务健康。
+    if 200 <= resp.status_code < 300 and resp.content and data.get("ok", True):
+        return {"ok": True, "error_type": "", "detail": "", "status_code": resp.status_code,
+                "data": data}
+    detail = str(data.get("error") or f"HTTP {resp.status_code}")
+    return {"ok": False, "error_type": "http_status", "detail": " ".join(redact(detail).split())[:240],
+            "status_code": resp.status_code, "data": data}
+
+
+async def _layered_health(request: Request, provider: str,
+                          health_payload: "dict | None" = None,
+                          *, deadline: float | None = None,
+                          processes: dict | None = None) -> dict:
+    """按 provider 组装五层健康结论；每层失败都不影响其他层出结论。
+
+    health_payload 传入本轮已取到的 /healthz 结论（api_status 循环里已经探过
+    一次），避免同一请求重复探活拖慢状态页。
+    所有探活共用一次总预算：慢初始化时不能让每一层各自耗尽一个超时。
+    """
+    deadline = deadline if deadline is not None else time.monotonic() + HEALTH_HTTP_TIMEOUT
+    result = {"provider": provider or "none",
+              "process": {"ok": False, "detail": ""},
+              "http": dict(_NOT_PROBED),
+              "list": dict(_NOT_PROBED),
+              "script": dict(_NOT_PROBED),
+              "playback": dict(_NOT_PROBED)}
+    if provider not in PROVIDERS:
+        result["process"]["detail"] = "未启用任何音源"
+        return result
+
+    programs = PROVIDER_PROGRAMS.get(provider, [provider])
+    if processes is None:
+        processes = await run_in_threadpool(
+            lambda: supervisor_status(timeout=max(0.01, min(1.0, deadline - time.monotonic()))))
+    states = {prog: processes.get(prog, {}).get("state", "UNKNOWN") for prog in programs}
+    missing = [p for p, s in states.items() if s != "RUNNING"]
+    result["process"]["ok"] = not missing
+    result["process"]["states"] = states
+    result["process"]["detail"] = ("" if not missing else "、".join(f"{p}:{states[p]}" for p in missing))
+    if missing:
+        # 进程层不过，HTTP 层结论无从谈起；保留"未探活"而不是拿上次结果冒充。
+        return result
+
+    if isinstance(health_payload, dict):
+        # 复用本轮已取到的 /healthz 结论（成败都算）：同一请求内不重复探活，
+        # 免得慢初始化把状态接口拖成多倍超时。
+        http_layer = health_payload
+        result["http"] = http_layer
+    else:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            result["http"] = {"ok": False, "error_type": "timeout", "detail": "健康检查总预算耗尽"}
+            return result
+        http_layer = await _probe_http_layer(
+            request, f"{PROVIDER_HEALTH[provider]}/healthz", timeout=remaining)
+        result["http"] = http_layer
+    if not http_layer["ok"]:
+        return result
+
+    # 源列表层：与健康应答分开看，能否取到音源列表是另一件事。
+    if provider == "lxmusic":
+        list_url = f"{CONF['lx_url']}/api/v1/source"
+    elif provider == "musicbox":
+        list_url = f"{CONF['musicbox_url']}/api/v1/public-playlists/capabilities"
+    else:
+        list_url = f"{CONF['musicdl_url']}/sources"
+    # 剩余总预算；已耗掉的部分从单次超时里扣，保证整轮探活有界。
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        result["list"] = {"ok": False, "error_type": "timeout",
+                          "detail": "健康检查总预算耗尽，未完成列表层探活"}
+        result["script"] = {"ok": False, "state": "unknown", "detail": "预算耗尽未取到脚本状态"}
+        result["playback"] = {"ok": False, "detail": "预算耗尽未完成播放就绪判定"}
+        return result
+    list_layer = await _probe_http_layer(request, list_url, timeout=remaining)
+    result["list"] = {"ok": list_layer["ok"], "error_type": list_layer.get("error_type", ""),
+                      "detail": list_layer.get("detail", "")}
+
+    # 脚本/播放层只对洛雪有意义：脚本初始化失败与服务器可达是两件事。
+    if provider == "lxmusic":
+        snapshot = http_layer.get("data", {}).get("user_source")
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        state = str(snapshot.get("state") or "unknown")
+        initialized = bool(snapshot.get("initialized"))
+        result["script"] = {
+            "ok": initialized and state == "ready",
+            "state": state,
+            "detail": " ".join(redact(str(snapshot.get("last_error") or "")).split())[:240],
+            "ready_count": int(snapshot.get("ready_count") or 0),
+            "failed_count": int(snapshot.get("failed_count") or 0),
+            "pending_count": int(snapshot.get("pending_count") or 0),
+        }
+    else:
+        result["script"] = {"ok": True, "state": "not_applicable", "detail": ""}
+    # 健康查询不解析真实歌曲，也不下载媒体；脚本就绪不能证明客户端能播放。
+    result["playback"] = {"ok": None, "state": "not_probed",
+                          "detail": "未执行曲目解析与媒体播放验证"}
+    return result
+
+
 @app.get("/api/status")
 async def api_status(request: Request):
     values = read_env()
     provider = current_provider(values)
-    processes = supervisor_status()
+    # 状态路由与分层探测共用一次预算；supervisor也采用有界异步调用。
+    probe_started = time.monotonic()
+    deadline = probe_started + HEALTH_HTTP_TIMEOUT
+    processes = await run_in_threadpool(lambda: supervisor_status(timeout=1.0))
     services: dict[str, dict] = {}
     lx_snapshot = None
+    # 本轮 /healthz 分段探活结果：services 与分段健康共用一份，避免同请求重复探活
+    # 拖慢状态接口（#108 现场要的是单次结论，不是多轮重试）。
+    active_probe = None
     for name, base in (("musicdl", CONF["musicdl_url"]), ("musicbox", CONF["musicbox_url"]),
                        ("lxmusic", CONF["lx_url"])):
-        if name in PROVIDERS and name != provider:
+        # 只对当前启用的音源探活。按需加载架构下其余音源就是未运行，
+        # 逐个探活既无意义又会让慢初始化把状态接口拖成数倍超时（#108）。
+        if name != provider:
             if name == "musicbox" and _resident_flag(values):
                 # 网易云歌单常驻：musicbox 非当前音源但应常驻运行，照常探活
-                ok, data = await _fetch_json(request, f"{base}/healthz")
+                resident_probe = await _probe_http_layer(
+                    request, f"{base}/healthz", timeout=max(0.01, deadline - time.monotonic()))
+                ok, data = resident_probe["ok"], resident_probe.get("data", {})
                 services[name] = {"reachable": ok,
                                   "note": "网易云歌单常驻" if ok else "网易云歌单常驻（进程未运行）"}
                 continue
             services[name] = {"reachable": False, "note": "未启用（按需未启动）"}
             continue
-        ok, data = await _fetch_json(request, f"{base}/healthz")
-        services[name] = {"reachable": ok, "detail": data if ok else data.get("error", "")}
-        if name == "lxmusic" and isinstance(data.get("user_source"), dict):
-            lx_snapshot = data["user_source"]
+        probe = await _probe_http_layer(
+            request, f"{base}/healthz",
+            timeout=max(0.01, deadline - time.monotonic()))
+        active_probe = probe
+        data = probe.get("data", {}) if isinstance(probe.get("data"), dict) else {}
+        ok = probe["ok"]
+        services[name] = {"reachable": ok,
+                          "detail": data if ok else probe.get("detail", "")}
+        if name == "lxmusic":
+            if isinstance(data.get("user_source"), dict):
+                lx_snapshot = data["user_source"]
     lx_source = None
     if provider == "lxmusic":
         # healthz 已带同轮源快照时直接复用，避免再次 query 产生重复负载或状态竞态。
         if lx_snapshot is not None:
             lx_source = _lx_source_snapshot(lx_snapshot)
         else:
-            ok, data = await _fetch_json(request, f"{CONF['lx_url']}/api/v1/source")
-            snapshot = data.get("data") if isinstance(data.get("data"), dict) else {}
-            lx_source = _lx_source_snapshot(snapshot, unavailable=not ok,
-                                             error=data.get("error", "unreachable") if not ok else "")
+            # 同时保留总预算与洛雪源接口顶层策略字段，不能选边覆盖。
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                lx_source = _lx_source_snapshot({}, unavailable=True,
+                                                error="健康检查总预算耗尽")
+            else:
+                ok, data = await _fetch_json(request, f"{CONF['lx_url']}/api/v1/source",
+                                             timeout=remaining)
+                payload = data if isinstance(data, dict) else {}
+                snapshot = dict(payload.get("data")) if isinstance(payload.get("data"), dict) else dict(payload)
+                for key in ("policy", "sources"):
+                    if key in payload and key not in snapshot:
+                        snapshot[key] = payload[key]
+                lx_source = _lx_source_snapshot(snapshot, unavailable=not ok,
+                                                error=payload.get("error", "unreachable") if not ok else "")
     return {
         "ok": True,
         "version": _read_version(),
@@ -1197,6 +1532,10 @@ async def api_status(request: Request):
         "previews": {p: round(preview_seconds_left(p)) for p in list(_preview_until)},
         "services": services,
         "lx_source": lx_source,
+        # 分段健康：进程/HTTP/列表/脚本/播放五层，各层独立结论。
+        # lxmusic 的 /healthz 本轮已取到，直接复用避免重复探活拖慢状态接口。
+        "health": await _layered_health(
+            request, provider, health_payload=active_probe, deadline=deadline, processes=processes),
     }
 
 
@@ -1209,11 +1548,15 @@ async def api_config():
         items = _derive_lx_list_actives(_lx_list_items(values.get("LX_SOURCE_LIST")), ref_url)
         if items:
             values["LX_SOURCE_LIST"] = _dumps_lx_list(items)
+    config_values = {key: values.get(key, spec["default"]) for key, spec in SCHEMA.items()}
+    # GET 只计算旧配置的兼容视图，不写 .env；真正迁移由共享模块和保存流程完成。
+    config_values.update(quality_migration(values))
     return {
         "ok": True,
-        "values": {key: values.get(key, spec["default"]) for key, spec in SCHEMA.items()},
+        "values": config_values,
         "presence": dict.fromkeys(values.keys(), True),
         "schema": SCHEMA,
+        "webui_build": STATIC_BUILD_ID,
         "env_path": str(ENV_PATH),
     }
 
@@ -1224,6 +1567,11 @@ class ConfigBody(BaseModel):
 
 class PreviewBody(BaseModel):
     provider: str
+
+
+class SourceReorderBody(BaseModel):
+    # 由 _normalize_lx_source_order 做严格类型与去重校验，避免 Pydantic 隐式转换 ID。
+    source_ids: list
 
 
 @app.post("/api/preview")
@@ -1285,10 +1633,14 @@ async def api_preview(body: PreviewBody, request: Request):
 @app.put("/api/config")
 async def api_config_put(body: ConfigBody, request: Request):
     before = read_env()
+    supplied = body.values or {}
+    ignored_keys = sorted(key for key in supplied if key in RETIRED_CONFIG_KEYS)
+    supported_values = {key: value for key, value in supplied.items() if key not in RETIRED_CONFIG_KEYS}
     try:
-        updates = validate_updates(body.values)
+        updates = validate_updates(supported_values)
     except ValueError as exc:
-        return JSONResponse(content={"ok": False, "error": str(exc)}, status_code=400)
+        return JSONResponse(content={"ok": False, "error": str(exc),
+                                     "ignored_keys": ignored_keys}, status_code=400)
 
     after_preview = dict(before)
     after_preview.update(updates)
@@ -1382,17 +1734,22 @@ async def api_config_put(body: ConfigBody, request: Request):
             report = {"ok": False, "data": {"message": str(exc)},
                       "category": "service_unavailable", "stage": "webui_to_lxmusic"}
         if not verify_ok:
-            message = (report.get("data") or {}).get("message") or report.get("error") or "校验失败"
-            category = report.get("category") or (report.get("data") or {}).get("category")
-            protected = category in ("initialization_pending", "source_operation_busy", "internal")
+            data = report.get("data") or {}
+            message = data.get("message") or report.get("error") or "校验失败"
+            category = report.get("category") or data.get("category")
+            has_evidence = bool(data.get("ok")) or any(
+                isinstance(a, dict) and a.get("result") == "ok" for a in data.get("attempts") or [])
+            incomplete = data.get("complete", report.get("complete")) is False and not has_evidence
+            protected = category in ("initialization_pending", "source_operation_busy", "internal",
+                                     "timeout", "identity_conflict", "unsafe_vm_required") or incomplete or bool(data.get("result_unknown"))
             if _is_service_unavailable(verify_status, report) or protected or verify_status >= 500 and not category:
-                category = category if protected and category != "internal" else "service_unavailable"
+                category = (category or "incomplete") if protected and category != "internal" else "service_unavailable"
                 return JSONResponse(
                     content={"ok": False, "error": f"洛雪音源暂未就绪，未改动配置：{message}",
                              "category": category,
                              "stage": report.get("stage") or (report.get("data") or {}).get("stage")
                                       or "webui_to_lxmusic"},
-                    status_code=409 if category == "source_operation_busy" else 504 if category == "initialization_pending" else 503,
+                    status_code=409 if category == "source_operation_busy" else 504 if category in ("initialization_pending", "timeout") else 503,
                 )
             if lx_reconcile:
                 disable_failed_source(url, message)
@@ -1453,7 +1810,8 @@ async def api_config_put(body: ConfigBody, request: Request):
     # 停掉/意外退出的 musicbox 进程
     resident_bypass = resident_keep and new_provider != "musicbox"
     if not changed and not force_lx_activate and not _preview_until and not resident_bypass:
-        return {"ok": True, "changed": [], "actions": [], "note": "配置无变化"}
+        return {"ok": True, "changed": [], "actions": [], "note": "配置无变化",
+                "ignored_keys": ignored_keys}
 
     # 音源切换（先停旧再起新）
     if old_provider != new_provider:
@@ -1530,7 +1888,15 @@ async def api_config_put(body: ConfigBody, request: Request):
                 sid = await _lx_source_post({"url": url},
                                             str(item.get("name") or "") or url, "activate")
                 if sid:
+                    # 保存 lxserver 返回的身份 ID，后续停用、重排和重新激活共用同一身份。
+                    item["id"] = sid
                     target_ids.add(sid)
+                    order_ids = json.loads(updates.get(
+                        "FNMUSIC_LX_SOURCE_ORDER", before.get("FNMUSIC_LX_SOURCE_ORDER", "[]")))
+                    if sid not in order_ids:
+                        order_ids.append(sid)
+                    updates["FNMUSIC_LX_SOURCE_ORDER"] = json.dumps(
+                        order_ids, ensure_ascii=False, separators=(",", ":"))
                 if not actions[-1]["ok"]:
                     if actions[-1].get("category") not in ("runtime", "runtime_error"):
                         activation_service_failed = True
@@ -1571,7 +1937,18 @@ async def api_config_put(body: ConfigBody, request: Request):
                     if p not in remaining_platforms:
                         remaining_platforms.append(p)
                 updates["LX_SOURCES"] = ",".join(remaining_platforms) if active_items else ""
-                corrections = write_env({k: updates[k] for k in ("LX_SOURCE_LIST", "LX_SOURCE_URL", "LX_SOURCES")})
+                corrections = write_env({k: updates[k] for k in (
+                    "LX_SOURCE_LIST", "LX_SOURCE_URL", "LX_SOURCES", "FNMUSIC_LX_SOURCE_ORDER")
+                    if k in updates})
+                changed.extend(k for k in corrections if k not in changed)
+                after = read_env()
+            else:
+                # 初次激活会返回真正 source.id；保存后非 LX 主音源也能只读展示稳定顺序。
+                corrections = write_env({
+                    "LX_SOURCE_LIST": updates["LX_SOURCE_LIST"],
+                    "FNMUSIC_LX_SOURCE_ORDER": updates.get(
+                        "FNMUSIC_LX_SOURCE_ORDER", before.get("FNMUSIC_LX_SOURCE_ORDER", "[]")),
+                })
                 changed.extend(k for k in corrections if k not in changed)
                 after = read_env()
         else:
@@ -1596,7 +1973,7 @@ async def api_config_put(body: ConfigBody, request: Request):
 
     restart_keys = [k for k in changed if SCHEMA.get(k, {}).get("reload") == "restart"]
     return {"ok": True, "changed": changed, "actions": actions, "restart_keys": restart_keys,
-            "warnings": warnings}
+            "warnings": warnings, "ignored_keys": ignored_keys}
 
 
 @app.get("/api/llm/usage")
@@ -1611,6 +1988,81 @@ async def api_llm_usage(limit: int = Query(30, ge=1, le=100), offset: int = Quer
     usage = await run_in_threadpool(
         llm_usage.summary, limit=daily_limit, history_limit=limit, history_offset=offset, read_only=True)
     return {"ok": True, "usage": usage}
+
+
+async def _proxy_lx_source_reorder(request: Request, source_ids: list[str]):
+    """把稳定 ID 顺序交给当前 lxmusic；上游错误时不写本地顺序配置。"""
+    try:
+        resp = await get_http(request).post(
+            f"{CONF['lx_url']}/api/v1/source/reorder",
+            json={"source_ids": source_ids}, timeout=10.0,
+        )
+    except httpx.HTTPError as exc:
+        return JSONResponse(content={"ok": False, "error": f"洛雪源排序请求失败：{exc}"},
+                            status_code=503)
+    payload = _resp_json(resp)
+    if resp.status_code >= 400 or payload.get("ok") is False:
+        status = resp.status_code if resp.status_code >= 400 else 400
+        return JSONResponse(content=payload or {"ok": False, "error": "洛雪源排序失败"},
+                            status_code=status)
+    return payload
+
+
+@app.post("/api/lx/source/reorder")
+async def api_lx_source_reorder(body: SourceReorderBody, request: Request):
+    """保存稳定 ID 顺序；仅洛雪主音源启用时访问上游，不因查看/保存设置启动服务。"""
+    try:
+        normalized = _normalize_lx_source_order(body.source_ids)
+        source_ids = json.loads(normalized)
+    except ValueError as exc:
+        return JSONResponse(content={"ok": False, "error": str(exc)}, status_code=400)
+
+    values = read_env()
+    lx_enabled = current_provider(values) == "lxmusic"
+    auto_switch = str(values.get("FNMUSIC_LX_AUTO_SWITCH", "true")).strip().lower() not in (
+        "false", "0", "no", "off")
+    if lx_enabled and auto_switch:
+        ready = await _lx_ensure_ready(request)
+        if not ready["ok"]:
+            return JSONResponse(content={"ok": False, "error": ready["error"],
+                                         "category": "service_unavailable", "stage": ready["stage"]},
+                                status_code=ready["status"])
+        result = await _proxy_lx_source_reorder(request, source_ids)
+        if isinstance(result, JSONResponse):
+            return result
+    else:
+        # 非洛雪主音源可保存偏好，但不得触发服务预览或上游请求。
+        result = {"ok": True, "deferred": True, "source_ids": source_ids}
+
+    try:
+        changed = write_env({"FNMUSIC_LX_SOURCE_ORDER": normalized})
+    except ValueError as exc:
+        return JSONResponse(content={"ok": False, "error": str(exc)}, status_code=409)
+    if not isinstance(result, dict):
+        result = {"ok": True}
+
+    # B契约统一返回：ok, data{source_ids, active_source_order, generation, policy}
+    data_payload = dict(result.get("data")) if isinstance(result.get("data"), dict) else {}
+    if not data_payload:
+        data_payload = {
+            "source_ids": source_ids,
+            "active_source_order": list(source_ids),
+            "generation": 0,
+            "policy": {
+                "auto_switch": auto_switch,
+                "platform_preferred": str(values.get("FNMUSIC_LX_PLATFORM_PREFERRED", "false")).strip().lower() in (
+                    "true", "1", "yes", "on"),
+                "source_order": source_ids,
+                "active_source_order": list(source_ids),
+                "generation": 0,
+            },
+        }
+    else:
+        data_payload.setdefault("source_ids", source_ids)
+        data_payload.setdefault("active_source_order", list(source_ids))
+        data_payload.setdefault("generation", 0)
+
+    return {**result, "ok": True, "data": data_payload, "source_ids": source_ids, "changed": changed}
 
 
 @app.post("/api/lx/verify")
@@ -1854,34 +2306,65 @@ async def netease_qr(unikey: str = Query(...)):
 
 
 @app.post("/api/fs-check")
-async def api_fs_check():
-    """目录权限校验占位端点（直连 8774 场景）。
-
-    桌面链路（统一网关）中该路径由宿主机侧 webui_gateway（root）拦截应答，
-    不会到达这里；能到达说明是独立浏览器/直连端口环境，WebUI 容器内看不到
-    宿主机真实目录，无法给出可信的可写性结论，明确回 501 让前端降级放行。
-    """
+async def api_fs_check(request: Request = None):
+    """目录权限校验。优先通过挂载的 maintenance socket 直连宿主；不可用时降级。"""
+    body = {}
+    if request:
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            body = {}
+    result = await _try_maintenance_socket("POST", "/api/fs-check", body)
+    if result is not None:
+        return result
     raise HTTPException(status_code=501, detail="直连模式不支持目录权限校验，请在飞牛桌面内打开管理台")
 
 
 @app.post("/api/maintenance/cleanup")
 @app.get("/api/maintenance/cleanup/{job_id}")
-async def api_maintenance_cleanup(job_id: str = ""):
-    """与 fs-check 一致：真实清理由宿主网关处理，直连不得访问或删除文件。"""
+async def api_maintenance_cleanup(request: Request, job_id: str = ""):
+    """清理垃圾文件。确认必须来自调用者，不得由代理自行补齐。"""
+    if job_id:
+        result = await _try_maintenance_socket("GET", f"/api/maintenance/cleanup/{job_id}")
+    else:
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        result = await _try_maintenance_socket("POST", "/api/maintenance/cleanup", body)
+    if result is not None:
+        return result
     raise HTTPException(status_code=501, detail="直连模式不支持清理垃圾文件，请在飞牛桌面内打开管理台")
 
 
 @app.get("/api/maintenance/music-users")
 async def api_maintenance_music_users():
-    """Music users are read by the host proxy through the desktop gateway."""
+    """读取飞牛音乐用户。优先通过 maintenance socket 直连宿主。"""
+    result = await _try_maintenance_socket("GET", "/api/maintenance/music-users")
+    if result is not None:
+        return result
     raise HTTPException(status_code=501, detail="直连模式不支持读取飞牛音乐用户，请在飞牛桌面内打开管理台")
 
 
 @app.get("/api/maintenance/organize")
 @app.get("/api/maintenance/organize/{job_id}")
 @app.post("/api/maintenance/organize")
-async def api_maintenance_organize(job_id: str = ""):
-    """真实整理同样只经宿主网关执行，直连 WebUI 不接触宿主文件。"""
+async def api_maintenance_organize(job_id: str = "", request: Request = None):
+    """整理下载目录。优先通过 maintenance socket 直连宿主。"""
+    if job_id:
+        result = await _try_maintenance_socket("GET", f"/api/maintenance/organize/{job_id}")
+    else:
+        method = request.method if request else "GET"
+        if method == "POST":
+            try:
+                body = await request.json()
+            except Exception:  # noqa: BLE001
+                body = {}
+            result = await _try_maintenance_socket("POST", "/api/maintenance/organize", body)
+        else:
+            result = await _try_maintenance_socket("GET", "/api/maintenance/organize")
+    if result is not None:
+        return result
     raise HTTPException(status_code=501, detail="直连模式不支持整理下载目录，请在飞牛桌面内打开管理台")
 
 
@@ -1958,6 +2441,47 @@ def _log_files_info() -> "list[dict]":
     ]
 
 
+def _redact_chunk(raw: bytes) -> bytes:
+    """导出前脱敏；异常时丢弃该行，绝不回传未脱敏原文。"""
+    try:
+        return redact(raw.decode("utf-8", errors="replace")).encode("utf-8", errors="replace")
+    except Exception:
+        return b"[redaction failed; content omitted]"
+
+
+def _copy_redacted(source, member, *, limit_bytes: int = 32 * 1024 * 1024) -> None:
+    """有界读取日志快照，超长行整行忽略，避免拆开令牌后泄露尾部。"""
+    buffer = b""
+    dropping = False
+    remaining = max(0, limit_bytes)
+    while remaining:
+        chunk = source.read(min(65536, remaining))
+        if not chunk:
+            break
+        remaining -= len(chunk)
+        for index, part in enumerate(chunk.split(b"\n")):
+            if index:
+                if dropping:
+                    member.write(b"[oversized log line omitted]\n")
+                else:
+                    member.write(_redact_chunk(buffer) + b"\n")
+                buffer = b""
+                dropping = False
+            if not dropping:
+                if len(buffer) + len(part) > 65536:
+                    buffer = b""
+                    dropping = True
+                else:
+                    buffer += part
+    if not remaining:
+        # 截断位置可能位于秘密值中间，丢弃未完成行而非输出尾片段。
+        member.write(b"[log snapshot truncated]\n")
+    elif dropping:
+        member.write(b"[oversized log line omitted]\n")
+    elif buffer:
+        member.write(_redact_chunk(buffer))
+
+
 def _write_log_archive(directory: Path, target: Path) -> None:
     """在线程池中执行日志读取、压缩与环境探测。"""
     with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1971,13 +2495,15 @@ def _write_log_archive(directory: Path, target: Path) -> None:
                     if (not stat.S_ISREG(opened.st_mode)
                             or (opened.st_dev, opened.st_ino) != (listed.st_dev, listed.st_ino)):
                         continue
+                    # issue #108：逐行脱敏后写入，避免一次性读入整个大日志文件。
                     with zf.open(item.name, "w") as member:
-                        shutil.copyfileobj(source, member)
+                        _copy_redacted(source, member)
             except OSError:
                 continue
         snapshot = "\n".join(env_snapshot_lines(
             "container" if Path("/.dockerenv").exists() else "host"))
-        zf.writestr("export_env_snapshot.txt", snapshot + "\n")
+        # 环境快照同样过一遍脱敏：它可能包含config摘要里遗漏的秘密值。
+        zf.writestr("export_env_snapshot.txt", redact(snapshot) + "\n")
 
 
 class _LogExportResponse(FileResponse):
@@ -2093,7 +2619,8 @@ async def api_logs_export():
 
 @app.get("/")
 async def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    return HTMLResponse(content=html.replace("__WEBUI_BUILD__", STATIC_BUILD_ID))
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
