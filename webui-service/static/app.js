@@ -70,17 +70,34 @@ let publicDetailRun = null;
 let publicDetailRunUser = "";
 let publicProcessSnapshot = null;
 
-async function api(path, options) {
-  const resp = await fetch(APP_BASE + path, options);
-  let body = {};
-  try { body = await resp.json(); } catch (_) { /* 非 JSON */ }
-  if (!resp.ok) {
-    const err = new Error(body.error || body.detail || `HTTP ${resp.status}`);
-    err.status = resp.status;
-    err.body = body;
-    throw err;
+async function api(path, options, timeoutMs = 0) {
+  const controller = timeoutMs > 0 ? new AbortController() : null;
+  let timer;
+  const request = async () => {
+    const resp = await fetch(APP_BASE + path, controller ? { ...options, signal: controller.signal } : options);
+    let body = {};
+    try { body = await resp.json(); } catch (_) { /* 非 JSON */ }
+    if (!resp.ok) {
+      const err = new Error(body.error || body.detail || `HTTP ${resp.status}`);
+      err.status = resp.status;
+      err.body = body;
+      throw err;
+    }
+    return body;
+  };
+  try {
+    if (!controller) return await request();
+    return await Promise.race([request(), new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        const error = new Error("请求超时，结果待核实，请刷新运行状态");
+        error.name = "TimeoutError";
+        reject(error);
+        controller.abort();
+      }, timeoutMs);
+    })]);
+  } finally {
+    clearTimeout(timer);
   }
-  return body;
 }
 
 function updateLlmLikedSettings() {
@@ -501,9 +518,9 @@ function formatVersionLabel(version) {
 }
 
 /* -------------------------------------------------------------- 概览 */
-async function loadStatus() {
+async function loadStatus(timeoutMs = 0) {
   try {
-    const st = await api("/api/status");
+    const st = await api("/api/status", undefined, timeoutMs);
     publicProcessSnapshot = { at: Date.now(), processes: st.processes || {} };
     for (const item of publicSelection) {
       if (item._detail_status === "stopped"
@@ -577,8 +594,8 @@ async function loadStatus() {
 }
 
 /* -------------------------------------------------------------- 配置读写 */
-async function loadConfig() {
-  const cfg = await api("/api/config");
+async function loadConfig(timeoutMs = 0) {
+  const cfg = await api("/api/config", undefined, timeoutMs);
   configValues = cfg.values;
   configPresence = cfg.presence || {};
   configSchema = cfg.schema || {};
@@ -830,68 +847,34 @@ function filterConfigBySchema(values) {
 }
 
 async function saveConfig() {
-  let values;
-  try { values = filterConfigBySchema(collectConfig()); } catch (exc) { toast(exc.message, "fail"); return; }
-  // 目录门禁：变更过的目录先经宿主网关校验可写，不可写直接阻断保存
-  // （直连 8774 等校验不可用的环境降级放行，不阻塞配置保存）
-  for (const [key, label] of [["FNMUSIC_TEE_SAVE_DIR", "下载目录"], ["FNMUSIC_CACHE_DIR", "歌曲缓存目录"]]) {
-    const next = values[key] || "";
-    if (next && next !== (configValues[key] || "")) {
-      const res = await fsCheckDir(next);
-      if (res.mode === "fail") { toast(label + "不可用：" + res.message, "fail"); return; }
-    }
-  }
   const btn = $("#save-btn");
+  if (btn.disabled) return;
   btn.disabled = true;
-  // 新激活的源保存时要逐个端到端校验（每源可达 1-2 分钟），给出预期提示
-  const pendingNew = lxPendingActivationCount();
-  btn.textContent = pendingNew > 0
-    ? `保存中（校验 ${pendingNew} 个新激活源，可能需要 1-2 分钟）…`
-    : "保存中…";
-  const syncOrderThroughProxy = values.FNMUSIC_LX_ENABLED === true
-    && $("#lx-auto-switch").checked
-    && Boolean(configSchema.FNMUSIC_LX_SOURCE_ORDER);
-  const requestedOrder = lxSourceOrder.slice();
-  if (syncOrderThroughProxy) delete values.FNMUSIC_LX_SOURCE_ORDER;
-  if (currentPage === "lx" && !lxSourceListDirty) delete values.LX_SOURCE_LIST;
+  const started = performance.now();
+  const deadline = started + 60000;
+  const remaining = () => Math.max(1, deadline - performance.now());
   try {
+    let values;
+    try { values = filterConfigBySchema(collectConfig()); } catch (exc) { toast(exc.message, "fail"); return; }
+    // 从点击起计时，目录检查共用三秒，不能在按钮禁用前无限等待。
+    btn.textContent = "保存中（检查目录）…";
+    for (const [key, label] of [["FNMUSIC_TEE_SAVE_DIR", "下载目录"], ["FNMUSIC_CACHE_DIR", "歌曲缓存目录"]]) {
+      const next = values[key] || "";
+      if (next && next !== (configValues[key] || "")) {
+        const res = await fsCheckDir(next, Math.max(1, started + 3000 - performance.now()));
+        if (res.mode === "fail") { toast(label + "不可用：" + res.message, "fail"); return; }
+      }
+    }
+    const pendingNew = lxPendingActivationCount();
+    btn.textContent = pendingNew > 0
+      ? `保存中（快速确认 ${pendingNew} 个新源，一分钟内返回）…`
+      : "保存中（一分钟内返回）…";
+    if (currentPage === "lx" && !lxSourceListDirty) delete values.LX_SOURCE_LIST;
     const result = await api("/api/config", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ values }),
-    });
-    let orderApplied = false;
-    if (syncOrderThroughProxy) {
-      // 配置保存可能为新激活源补入 lxserver ID；将它们追加到用户排序之后再调用专用代理。
-      const savedConfig = await api("/api/config");
-      let savedOrder = [];
-      try {
-        const parsed = JSON.parse(savedConfig.values.FNMUSIC_LX_SOURCE_ORDER || "[]");
-        if (Array.isArray(parsed)) savedOrder = parsed.filter((id) => typeof id === "string");
-      } catch (_) { /* 共享配置格式错误时保留当前顺序，接口会给出明确校验错误 */ }
-      const finalOrder = requestedOrder.slice();
-      savedOrder.forEach((id) => { if (!finalOrder.includes(id)) finalOrder.push(id); });
-      if (JSON.stringify(finalOrder) !== JSON.stringify(savedOrder)) {
-        try {
-          const reorder = await api("/api/lx/source/reorder", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ source_ids: finalOrder }),
-          });
-          orderApplied = Boolean((reorder.changed || []).includes("FNMUSIC_LX_SOURCE_ORDER"));
-          if (orderApplied) result.changed = [...new Set([...(result.changed || []), "FNMUSIC_LX_SOURCE_ORDER"])];
-        } catch (exc) {
-          await loadConfig();
-          await loadStatus();
-          const isBusy = exc.status === 409 || exc.body?.category === "source_operation_busy";
-          const reason = isBusy
-            ? (exc.message && exc.message.includes("忙") ? exc.message : "洛雪源正忙，请稍候重试")
-            : exc.message;
-          toast(`其他配置已保存；洛雪源排序失败，${reason}；已恢复保存顺序`, "fail");
-          return;
-        }
-      }
-    }
+    }, remaining());
     const failed = (result.actions || []).filter((a) => !a.ok && !a.auto_disabled);
     const warnings = result.warnings || [];
     const parts = [];
@@ -905,31 +888,44 @@ async function saveConfig() {
       if (a.kind === "lx_activate" && !a.auto_disabled) {
         const label = a.source ? `「${a.source}」` : "";
         const op = a.op === "deactivate" ? "取消激活" : "激活";
-        parts.push(`洛雪源${label}${op}${a.ok ? "成功" : "失败"}`);
+        const outcome = a.ok ? "成功" : a.category === "not_executed" ? "未执行"
+          : ["result_unknown", "initialization_pending"].includes(a.category) ? "结果待核实" : "失败";
+        parts.push(`洛雪源${label}${op}${outcome}`);
       }
+      if (a.kind === "lx_reorder") parts.push(`洛雪源排序${a.ok ? "成功" : "未确认，保留原顺序"}`);
     });
     warnings.forEach((w) => {
       if (w.category && !["runtime", "runtime_error"].includes(w.category)) {
-        const reason = { service_unavailable: "服务暂不可用", initialization_pending: "初始化待定", source_operation_busy: "源操作忙碌" }[w.category] || "状态暂不可确认";
-        parts.push(`洛雪源「${w.source || lxDefaultName(w.url)}」${reason}，激活配置已保留${w.message ? `（${w.message}）` : ""}`);
+        const reason = { service_unavailable: "服务暂不可用", initialization_pending: "初始化待定", source_operation_busy: "源操作忙碌",
+          result_unknown: "结果待核实", not_executed: "未执行" }[w.category] || "状态暂不可确认";
+        const state = w.saved_active === false ? "未保存为激活" : "激活配置已保留";
+        parts.push(`洛雪源「${w.source || lxDefaultName(w.url)}」${reason}，${state}${w.message ? `（${w.message}）` : ""}`);
+      } else if (w.auto_disabled === false) {
+        parts.push(`洛雪源「${w.source || lxDefaultName(w.url)}」初始化失败，保留原激活配置${w.message ? `（${w.message}）` : ""}`);
       } else {
         parts.push(`洛雪源「${w.source || lxDefaultName(w.url)}」失效，无法激活，已自动取消激活${w.message ? `（${w.message}）` : ""}`);
       }
     });
-    if (failed.length) {
+    if (failed.length || result.complete === false) {
       toast((parts.join("；") || "") + ` —— ${failed.map((f) => f.error).join("；")}`, "fail");
     } else {
       toast(parts.join("；") || "配置无变化", "ok");
     }
-    clearDirty();
-    await loadConfig();
-    await loadStatus();
+    if (result.values) {
+      configValues = { ...configValues, ...result.values };
+      applyConfigToForm();
+      clearDirty();
+    } else {
+      // 兼容旧后端；配置回读仍使用本次剩余预算。
+      await loadConfig(remaining());
+    }
+    void loadStatus(3000);
     refreshLlmUsage();
   } catch (exc) {
     lxRuntimeSnapshot = null;
     renderLxSourceList();
     toast("保存失败：" + exc.message, "fail");
-    await loadStatus();
+    void loadStatus(3000);
   } finally {
     btn.disabled = false;
     btn.textContent = "保存并生效";
@@ -2629,19 +2625,20 @@ const _authorizedDirs = new Set();  // authorizeUserFile 每个路径只尝试�
 
 /* 目录权限校验：桌面链路由宿主机网关（root，真实落盘视角）拦截应答；
    直连 8774 时 WebUI 返回 501（容器内看不到宿主路径），降级为 skip 放行。 */
-async function fsCheckDir(path) {
+async function fsCheckDir(path, timeoutMs = 0) {
   try {
     const r = await api("/api/fs-check", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path }),
-    });
+    }, timeoutMs);
     if (!r.writable) {
       return { mode: "fail", message: r.exists ? "目录不可写（权限不足或只读挂载）" : "目录无法创建（父目录不可写）" };
     }
     if (!r.exists) return { mode: "warn", message: "目录不存在；父目录可写，保存后自动创建" };
     return { mode: "ok", message: "目录可写 ✓" };
   } catch (exc) {
+    if (exc.name === "TimeoutError") return { mode: "fail", message: "目录检查超时，请重试" };
     return { mode: "skip", message: "目录校验不可用（" + exc.message + "），保存时不校验权限" };
   }
 }
@@ -2705,6 +2702,7 @@ DIR_FIELDS.forEach(bindDirField);
   // 桌面网关路径下才尝试加载 SDK；探测失败（直连 8774）保持隐藏
   const pathname = (typeof window !== "undefined" && window.location && window.location.pathname) || "";
   if (pathname.startsWith("/app/")) {
+    $("#log-nas-btn").hidden = false;
     const sdk = await loadTrimSdk();
     if (sdk) {
       $("#lx-pick").hidden = false;
@@ -2842,39 +2840,197 @@ async function loadAbout() {
   checkUpdate();
 }
 
+let logShareFile = null;
+
+function isMobileExportDevice() {
+  const coarse = !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
+  const userAgent = (globalThis.navigator && globalThis.navigator.userAgent) || "";
+  return coarse || /Android|iPhone|iPad|Mobile/i.test(userAgent);
+}
+
+function canShareLogFiles() {
+  const nav = globalThis.navigator;
+  return !!(nav && typeof nav.canShare === "function" && typeof nav.share === "function" &&
+    typeof File === "function");
+}
+
+function setLogExportBusy(busy) {
+  ["#log-export-btn", "#log-share-btn", "#log-nas-btn"].forEach((id) => {
+    $(id).disabled = busy;
+  });
+}
+
+function clearPreparedLogShare(clearNote) {
+  logShareFile = null;
+  $("#log-share-btn").hidden = true;
+  if (clearNote) $("#log-export-note").textContent = "";
+}
+
+function browserDownloadLog(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = name;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+  $("#log-export-note").textContent =
+    `已发起下载 ${name}，保存位置由浏览器或系统设置决定`;
+}
+
+async function fetchLogArchive() {
+  const resp = await fetch(APP_BASE + "/api/logs/export");
+  if (!resp.ok) {
+    let msg = `HTTP ${resp.status}`;
+    try { msg = (await resp.json()).error || msg; } catch (_) { /* 非 JSON */ }
+    throw new Error(msg);
+  }
+  const blob = await resp.blob();
+  const match = (resp.headers.get("content-disposition") || "").match(/filename="?([^";]+)"?/);
+  const name = match ? match[1] : `fnmusic-logs-${Date.now()}.zip`;
+  return { blob, name };
+}
+
 async function exportLogs() {
-  const btn = $("#log-export-btn");
-  const note = $("#log-export-note");
-  if (btn.disabled) return;
-  btn.disabled = true;
-  note.textContent = "打包中…";
+  if ($("#log-export-btn").disabled) return;
+  setLogExportBusy(true);
+  $("#log-export-note").textContent = "打包中…";
+  $("#log-export-result").hidden = true;
   try {
-    const resp = await fetch(APP_BASE + "/api/logs/export");
-    if (!resp.ok) {
-      let msg = `HTTP ${resp.status}`;
-      try { msg = (await resp.json()).error || msg; } catch (_) { /* 非 JSON */ }
-      throw new Error(msg);
+    const archive = await fetchLogArchive();
+    if (isMobileExportDevice() && canShareLogFiles()) {
+      logShareFile = new File([archive.blob], archive.name, { type: "application/zip" });
+      const supported = globalThis.navigator.canShare({
+        files: [logShareFile], title: "fnmusic-ext 日志",
+      });
+      if (supported) {
+        $("#log-share-btn").hidden = false;
+        $("#log-export-note").textContent =
+          `ZIP 已准备好（${archive.name}），请点击“保存或分享 ZIP”`;
+        return;
+      }
+      logShareFile = null;
     }
-    const blob = await resp.blob();
-    const m = (resp.headers.get("content-disposition") || "").match(/filename="?([^";]+)"?/);
-    const name = m ? m[1] : `fnmusic-logs-${Date.now()}.logzip`;
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = name;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 4000);
-    note.textContent = `已导出 ${name}`;
+    browserDownloadLog(archive.blob, archive.name);
   } catch (exc) {
-    note.textContent = "";
+    $("#log-export-note").textContent = "";
     toast("日志导出失败：" + exc.message, "fail");
+    clearPreparedLogShare(false);
   } finally {
-    btn.disabled = false;
+    setLogExportBusy(false);
   }
 }
 $("#log-export-btn").addEventListener("click", () => { exportLogs().catch(() => {}); });
+
+async function sharePreparedLogs() {
+  if (!logShareFile || $("#log-share-btn").disabled) return;
+  setLogExportBusy(true);
+  try {
+    await globalThis.navigator.share({
+      files: [logShareFile],
+      title: "fnmusic-ext 日志",
+      text: "fnmusic-ext 运行日志",
+    });
+    $("#log-export-note").textContent = "系统分享流程已结束";
+  } catch (exc) {
+    if (exc && exc.name === "AbortError") {
+      $("#log-export-note").textContent = "已取消分享，ZIP 仍保留，可再次保存或分享";
+    } else {
+      browserDownloadLog(logShareFile, logShareFile.name);
+      toast("系统分享不可用，已改为下载 ZIP；也可保存到 NAS", "fail");
+    }
+  } finally {
+    setLogExportBusy(false);
+  }
+}
+$("#log-share-btn").addEventListener("click", () => { sharePreparedLogs().catch(() => {}); });
+
+async function exportLogsToNas() {
+  if ($("#log-nas-btn").disabled) return;
+  setLogExportBusy(true);
+  $("#log-export-result").hidden = true;
+  $("#log-export-note").textContent = "选择 NAS 保存目录…";
+  try {
+    const sdk = await loadTrimSdk();
+    if (!sdk) {
+      $("#log-export-note").textContent = "当前环境不支持 NAS 保存，请在飞牛 App 或飞牛桌面内打开";
+      return;
+    }
+    if (sdk.isStandaloneWeb) {
+      $("#log-export-note").textContent = "请从飞牛 App 或飞牛桌面打开管理台后再保存到 NAS";
+      return;
+    }
+    if (typeof sdk.pickUserFile !== "function") {
+      $("#log-export-note").textContent = "当前飞牛版本不支持目录选择，请升级飞牛 App 或系统";
+      return;
+    }
+    const picked = await sdk.pickUserFile({
+      directory: true,
+      title: "选择日志保存位置",
+      okText: "保存到这里",
+      creatable: true,
+      sidebarGroup: ["myFiles", "otherShare", "external", "remote", "favorites"],
+    });
+    const paths = (picked && picked.data) || [];
+    if (!paths.length) {
+      $("#log-export-note").textContent = "已取消选择目录，未导出日志";
+      return;
+    }
+    const directory = paths[0];
+    $("#log-export-note").textContent = "正在打包并保存到 NAS…";
+    const resp = await fetch(APP_BASE + "/api/logs/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ directory }),
+    });
+    let body = {};
+    try { body = await resp.json(); } catch (_) { /* 非 JSON */ }
+    if (!resp.ok || !body.ok) throw new Error(body.error || body.detail || `HTTP ${resp.status}`);
+    const result = $("#log-export-result");
+    $("#log-export-path").textContent = body.path;
+    $("#log-export-path").dataset.directory = directory;
+    $("#log-export-path").dataset.path = body.path;
+    result.hidden = false;
+    $("#log-export-note").textContent = `已保存 ${body.filename}`;
+    clearPreparedLogShare(false);
+  } catch (exc) {
+    $("#log-export-note").textContent = "";
+    toast("保存到 NAS 失败：" + exc.message, "fail");
+  } finally {
+    setLogExportBusy(false);
+  }
+}
+$("#log-nas-btn").addEventListener("click", () => { exportLogsToNas().catch(() => {}); });
+
+async function copyLogExportPath() {
+  const path = $("#log-export-path").dataset.path || "";
+  if (!path) return;
+  try {
+    await globalThis.navigator.clipboard.writeText(path);
+    toast("路径已复制", "ok");
+  } catch (_) {
+    toast("复制失败，请手动复制显示的路径", "fail");
+  }
+}
+$("#log-copy-path").addEventListener("click", () => { copyLogExportPath().catch(() => {}); });
+
+async function openLogExportFolder() {
+  const directory = $("#log-export-path").dataset.directory || "";
+  if (!directory) return;
+  try {
+    const sdk = await loadTrimSdk();
+    if (!sdk || typeof sdk.openFileManager !== "function") {
+      throw new Error("当前环境不支持打开文件管理器");
+    }
+    await sdk.openFileManager(directory);
+  } catch (exc) {
+    toast("打开文件夹失败：" + exc.message, "fail");
+  }
+}
+$("#log-open-folder").addEventListener("click", () => { openLogExportFolder().catch(() => {}); });
+
+window.addEventListener("pagehide", () => { clearPreparedLogShare(false); });
 
 /* -------------------------------------------------------------- 检查更新 */
 async function checkUpdate() {

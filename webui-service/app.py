@@ -18,6 +18,7 @@ import os
 import re
 import shlex
 import shutil
+import secrets
 import stat
 import subprocess
 import sys
@@ -26,6 +27,7 @@ import time
 import urllib.parse
 import zipfile
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 import anyio
@@ -83,7 +85,8 @@ ENV_PATH = Path(CONF["repo_dir"]) / ".env"
 
 MAINTENANCE_SOCKET = "/run/fnmusic-ext/maintenance.sock"
 
-async def _try_maintenance_socket(method: str, path: str, body: dict | None = None) -> dict | JSONResponse | None:
+async def _try_maintenance_socket(method: str, path: str, body: dict | None = None,
+                                 *, timeout: float = 35.0) -> dict | JSONResponse | None:
     """Try to call the host maintenance socket directly (for direct-mode access).
 
     Returns JSON on success, an error response preserving the host status,
@@ -93,7 +96,7 @@ async def _try_maintenance_socket(method: str, path: str, body: dict | None = No
         return None
     try:
         transport = httpx.AsyncHTTPTransport(uds=MAINTENANCE_SOCKET)
-        async with httpx.AsyncClient(transport=transport, base_url="http://unix", timeout=35.0) as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://unix", timeout=timeout) as client:
             if method == "GET":
                 resp = await client.get(path)
             else:
@@ -234,7 +237,8 @@ def current_provider(values: dict[str, str]) -> str:
 
 
 def write_env(updates: dict[str, str]) -> list[str]:
-    with env_file_lock(ENV_PATH):
+    timeout = _save_remaining(1.0) if _config_save_deadline.get() is not None else None
+    with env_file_lock(ENV_PATH, timeout=timeout):
         updates = dict(updates)
         if "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER" in updates:
             current = read_env()
@@ -285,15 +289,29 @@ def _write_env_unlocked(updates: dict[str, str]) -> list[str]:
 
 # ------------------------------------------------------------------ supervisor --
 
+CONFIG_SAVE_TIMEOUT = 55.0
+_config_save_deadline: ContextVar[float | None] = ContextVar("config_save_deadline", default=None)
+_config_save_lock = asyncio.Lock()
+
+
+def _save_remaining(limit: float = 55.0) -> float:
+    deadline = _config_save_deadline.get()
+    remaining = min(limit, deadline - time.monotonic()) if deadline is not None else limit
+    if remaining <= 0:
+        raise TimeoutError("保存预算已耗尽")
+    return remaining
+
+
 def supervisorctl(*args: str, timeout: float = 20.0) -> tuple[int, str]:
     # WEBUI_SUPERVISORCTL 可携带参数（如 "supervisorctl -c /path/supervisord.conf"），
     # 按 shell 词法拆分；默认裸 "supervisorctl" 拆分后行为不变。
     cmd = shlex.split(CONF["supervisorctl"]) + list(args)
     try:
+        timeout = _save_remaining(timeout)
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except FileNotFoundError:
         return 127, "supervisorctl not found"
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, TimeoutError):
         return 124, f"supervisorctl {' '.join(args)} timed out"
     output = (proc.stdout or "") + (proc.stderr or "")
     return proc.returncode, output.strip()
@@ -428,16 +446,6 @@ def _lx_ready_error(stage: str, detail: str = "") -> str:
             else "洛雪音源服务 lxmusic 不可连接，请查看 lxmusic 运行日志")
     detail = " ".join(redact(str(detail or "")).split())[:120]
     return f"{base}（{detail}）" if detail else base
-
-
-def _is_service_unavailable(status_code: int, payload: dict) -> bool:
-    """上游是否报告内部服务不可用（而非脚本本身失效）。"""
-    # 只认 lxmusic 明确标注的内部服务故障：它自己的上传/校验失败也可能回 503
-    # （如源下载超时），那种 503 属于脚本问题，不能据此跳过源失效处理。
-    payload = payload or {}
-    data = payload.get("data")
-    return (payload.get("category") == "service_unavailable"
-            or isinstance(data, dict) and data.get("category") == "service_unavailable")
 
 
 async def _lx_probe(client: "httpx.AsyncClient", *, timeout: float = 3.0) -> tuple[bool, str, str]:
@@ -684,12 +692,12 @@ async def _reconcile_musicbox_resident(client: "httpx.AsyncClient", values: dict
         return
     want = _resident_active(values)
     _resident_state["active"] = False
-    running = _musicbox_proc_running()
+    running = await run_in_threadpool(_musicbox_proc_running)
     if want and _public_musicbox_needed(values) and time.monotonic() < _resident_start_block["until"]:
         _resident_start_block.update(until=0.0, reason="")
     if not want:
         if running:
-            code, out = supervisorctl("stop", "musicbox")
+            code, out = await run_in_threadpool(supervisorctl, "stop", "musicbox")
             actions.append({"kind": "resident", "op": "stop",
                             "ok": code == 0, "error": "" if code == 0 else out})
             logger.info("[resident] 网易云歌单常驻未勾选，停止 musicbox 进程")
@@ -700,7 +708,7 @@ async def _reconcile_musicbox_resident(client: "httpx.AsyncClient", values: dict
                 actions.append({"kind": "resident", "op": "deactivate", "ok": False,
                                 "error": _resident_start_block["reason"]})
             return
-        code, out = supervisorctl("start", "musicbox")
+        code, out = await run_in_threadpool(supervisorctl, "start", "musicbox")
         if code != 0:
             actions.append({"kind": "resident", "op": "start", "ok": False, "error": out})
             logger.warning("[resident] musicbox 常驻启动失败: %s", out)
@@ -728,7 +736,7 @@ async def _reconcile_musicbox_resident(client: "httpx.AsyncClient", values: dict
             return
         _resident_start_block.update(until=time.monotonic() + _RESIDENT_RETRY_BLOCK_S,
                                      reason=_RESIDENT_NOT_LOGGED_IN)
-        code, out = supervisorctl("stop", "musicbox")
+        code, out = await run_in_threadpool(supervisorctl, "stop", "musicbox")
         actions.append({"kind": "resident", "op": "stop", "ok": code == 0, "error": "" if code == 0 else out})
         if warn:
             actions.append({"kind": "resident", "op": "deactivate", "ok": False,
@@ -852,33 +860,6 @@ def _lx_source_snapshot(snapshot: dict, *, unavailable: bool = False, error: str
         result["error"] = error
         result["last_error"] = snapshot.get("last_error") or error
     return result
-
-
-async def _lx_enabled_sources(request: Request) -> list[dict]:
-    resp = await get_http(request).get(f"{CONF['lx_url']}/api/v1/source", timeout=10.0)
-    data = _resp_json(resp)
-    if resp.status_code != 200 or not data.get("ok"):
-        raise RuntimeError(data.get("error") or f"HTTP {resp.status_code}")
-    return ((data.get("data") or {}).get("sources") or [])
-
-
-async def _lx_enabled_platforms(request: Request, excluded_urls: set[str] | None = None) -> list[str]:
-    """读取 lxmusic 当前全部启用源的声明平台并集（保持出现顺序）；不可达返回空列表。"""
-    try:
-        resp = await get_http(request).get(f"{CONF['lx_url']}/api/v1/source", timeout=10.0)
-        data = _resp_json(resp)
-        sources = ((data or {}).get("data") or {}).get("sources") or []
-        platforms: list[str] = []
-        for s in sources:
-            if str(s.get("url") or "").strip() in (excluded_urls or set()):
-                continue
-            for p in (s or {}).get("platforms") or []:
-                p = str(p).strip()
-                if p and p not in platforms:
-                    platforms.append(p)
-        return platforms
-    except Exception:  # noqa: BLE001
-        return []
 
 
 def _normalize_dir_path(label: str, raw) -> str:
@@ -1138,7 +1119,9 @@ async def _lifespan(_app: FastAPI):
         while True:
             await asyncio.sleep(15.0)
             try:
-                preview_reap()
+                if not _config_save_lock.locked():
+                    async with _config_save_lock:
+                        await run_in_threadpool(preview_reap)
             except Exception:  # noqa: BLE001
                 logger.exception("预览清退循环异常")
             today = time.localtime().tm_yday
@@ -1152,10 +1135,11 @@ async def _lifespan(_app: FastAPI):
         # 三选一开关，容器/原生重启后由这里兜底；先等 supervisor 就绪再跑）
         await asyncio.sleep(5.0)
         try:
-            values = read_env()
-            if _resident_active(values) and current_provider(values) != "musicbox":
-                async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=3.0)) as bclient:
-                    await _reconcile_musicbox_resident(bclient, values, [])
+            async with _config_save_lock:
+                values = read_env()
+                if _resident_active(values) and current_provider(values) != "musicbox":
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=3.0)) as bclient:
+                        await _reconcile_musicbox_resident(bclient, values, [])
         except Exception:  # noqa: BLE001  # 开机对账失败不影响 WebUI，下次保存再收口
             logger.exception("网易云歌单常驻开机对账异常")
 
@@ -1423,7 +1407,7 @@ async def _layered_health(request: Request, provider: str,
 
     # 源列表层：与健康应答分开看，能否取到音源列表是另一件事。
     if provider == "lxmusic":
-        list_url = f"{CONF['lx_url']}/api/v1/source"
+        list_url = f"{CONF['lx_url']}/api/v1/source?read_only=true"
     elif provider == "musicbox":
         list_url = f"{CONF['musicbox_url']}/api/v1/public-playlists/capabilities"
     else:
@@ -1513,7 +1497,7 @@ async def api_status(request: Request):
                 lx_source = _lx_source_snapshot({}, unavailable=True,
                                                 error="健康检查总预算耗尽")
             else:
-                ok, data = await _fetch_json(request, f"{CONF['lx_url']}/api/v1/source",
+                ok, data = await _fetch_json(request, f"{CONF['lx_url']}/api/v1/source?read_only=true",
                                              timeout=remaining)
                 payload = data if isinstance(data, dict) else {}
                 snapshot = dict(payload.get("data")) if isinstance(payload.get("data"), dict) else dict(payload)
@@ -1630,8 +1614,287 @@ async def api_preview(body: PreviewBody, request: Request):
     return {"ok": True, "preview": True, "seconds_left": PREVIEW_TTL}
 
 
+def _saved_source_target(sources: list[dict], item: dict) -> dict | None:
+    """优先稳定 ID / URL；旧本地文件只接受唯一名称匹配。"""
+    sid, url = str(item.get("id") or ""), str(item.get("url") or "")
+    base = urllib.parse.unquote(url).replace("\\", "/").rsplit("/", 1)[-1] if url.startswith("file://") else ""
+    stem = base.removesuffix(".js")
+    for matches in (
+        [s for s in sources if sid and str(s.get("id") or "") == sid],
+        [s for s in sources if url and s.get("url") == url],
+        [s for s in sources if base and (
+            str(s.get("id") or "") in (base, stem) or str(s.get("name") or "") == stem)],
+    ):
+        if matches:
+            return matches[0] if len(matches) == 1 else None
+    return None
+
+
+async def _save_lx_http(request: Request, method: str, path: str, *,
+                        seconds: float, payload: dict | None = None) -> tuple[int, dict]:
+    # HTTPX 的 timeout 是分段 I/O 时限；外层同时约束整次调用。
+    seconds = _save_remaining(seconds)
+    async with asyncio.timeout(seconds):
+        response = await get_http(request).request(
+            method, f"{CONF['lx_url']}{path}", json=payload, timeout=seconds)
+    return response.status_code, _resp_json(response)
+
+
+class _SaveSnapshotError(ValueError):
+    def __init__(self, message: str, stage: str):
+        super().__init__(message)
+        self.stage = stage
+
+
+async def _save_lx_snapshot(request: Request, seconds: float = 3.0) -> list[dict]:
+    code, payload = await _save_lx_http(request, "GET", "/api/v1/source?read_only=true", seconds=seconds)
+    if code != 200 or payload.get("ok") is not True:
+        data = payload.get("data") or {}
+        stage = payload.get("stage") or (data.get("stage") if isinstance(data, dict) else "")
+        raise _SaveSnapshotError(payload.get("error") or "读取洛雪运行状态失败",
+                                 stage or "webui_to_lxmusic")
+    data = payload.get("data")
+    sources = data.get("sources") if isinstance(data, dict) else None
+    if not isinstance(sources, list) or any(
+            not isinstance(s, dict) or not (s.get("id") or s.get("url")) for s in sources):
+        raise ValueError("洛雪运行状态格式异常")
+    return sources
+
+
+async def _save_lx_updates(request: Request, before: dict, updates: dict,
+                            actions: list[dict], warnings: list[dict]):
+    """只对差异做快速初始化确认，完整搜索/解析/探活由独立测试接口执行。
+
+    逐项成功才更新目标配置；未知写结果只回读，不重放写请求。给回读和
+    原子写配置预留总预算的最后五秒，多源共享之前的操作期限。
+    """
+    list_supplied = "LX_SOURCE_LIST" in updates
+    legacy_url = "LX_SOURCE_URL" in updates and not list_supplied
+    explicit_order = "FNMUSIC_LX_SOURCE_ORDER" in updates
+    if not (list_supplied or legacy_url or explicit_order):
+        return None
+    old_items = _derive_lx_list_actives(
+        _lx_list_items(before.get("LX_SOURCE_LIST")), str(before.get("LX_SOURCE_URL") or ""))
+    if not old_items and before.get("LX_SOURCE_URL"):
+        old_items = [{"url": before["LX_SOURCE_URL"], "active": True}]
+    old_by_url = {i["url"]: i for i in old_items}
+    if legacy_url:
+        url = str(updates["LX_SOURCE_URL"] or "")
+        items = [{"url": url, "active": True}] if url else []
+    elif list_supplied:
+        items = _derive_lx_list_actives(_lx_list_items(updates["LX_SOURCE_LIST"]),
+                                      str(updates.get("LX_SOURCE_URL", before.get("LX_SOURCE_URL")) or ""))
+    else:
+        items = [dict(i) for i in old_items]
+    if (list_supplied or legacy_url) and not any(i.get("active") for i in items):
+        saved_inactive = bool(old_items) and all(i.get("active") is False for i in old_items)
+        if not saved_inactive:
+            return JSONResponse(status_code=400, content={"ok": False, "error": "请至少激活一个洛雪源"})
+    try:
+        sources = await _save_lx_snapshot(request, _save_remaining(3.0))
+    except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+        return JSONResponse(status_code=503, content={
+            "ok": False, "category": "service_unavailable",
+            "stage": getattr(exc, "stage", "webui_to_lxmusic"),
+            "error": f"无法读取洛雪运行状态，未改动配置：{redact(str(exc))}"})
+    operation_deadline = _config_save_deadline.get() - min(5.0, CONFIG_SAVE_TIMEOUT * 0.15)
+    desired = {i["url"]: i for i in items}
+    confirmed_targets = {i["url"]: _saved_source_target(sources, i) for i in items}
+    jobs = []
+    if list_supplied or legacy_url:
+        # 用户取消项优先；未变且已就绪的源不重复激活、不重新下载。
+        for url, item in old_by_url.items():
+            if item.get("active") and not desired.get(url, {}).get("active"):
+                jobs.append((desired.get(url, dict(item)), False))
+        for item in items:
+            target = _saved_source_target(sources, item)
+            if item.get("active") and (not target or target.get("status") != "success"):
+                jobs.append((item, True))
+            elif target and target.get("id"):
+                item["id"] = str(target["id"])
+    unknown = []
+    for item, enabled in jobs:
+        url = item["url"]
+        original = bool(old_by_url.get(url, {}).get("active"))
+        action = {"kind": "lx_activate", "op": "activate" if enabled else "deactivate",
+                  "source": item.get("name") or url, "url": url, "ok": False, "error": ""}
+        actions.append(action)
+        seconds = min(12.0, operation_deadline - time.monotonic())
+        target = None
+        if seconds <= 0:
+            action.update(category="not_executed", error="保存预算已耗尽，本项未执行")
+        else:
+            payload = {"url": url, "enabled": enabled,
+                       "timeout_s": max(0.01, seconds - min(0.5, seconds * 0.1))}
+            try:
+                code, response = await _save_lx_http(
+                    request, "POST", "/api/v1/source", seconds=seconds, payload=payload)
+                data = response.get("data") or {}
+                entries = data.get("sources") or [] if isinstance(data, dict) else []
+                entries = [s for s in entries if isinstance(s, dict)]
+                target = _saved_source_target(entries, {**item, "id": response.get("source_id") or item.get("id")})
+                ok = code == 200 and response.get("ok") is True
+                category = response.get("category") or (data.get("category") if isinstance(data, dict) else "") or (
+                    "runtime" if target and target.get("status") == "failed"
+                    else "service_unavailable" if code >= 500 else "initialization_pending")
+                if enabled and ok and (not target or target.get("status") != "success"):
+                    ok = False
+                action.update(ok=ok, category="" if ok else category,
+                              error="" if ok else redact(str(response.get("error") or (
+                                  target.get("error") if target else "") or "源初始化结果待确认")))
+                if ok:
+                    # 成功响应已包含本次管理操作结束后的运行快照。
+                    if entries:
+                        sources = entries
+                    elif not enabled:
+                        prior = _saved_source_target(sources, item)
+                        sources = [s for s in sources if s is not prior]
+            except (httpx.HTTPError, TimeoutError) as exc:
+                action.update(category="result_unknown",
+                              error=f"操作响应超时或连接中断，结果待核实（{type(exc).__name__}）")
+        if action["ok"]:
+            item["active"] = enabled
+            if target and target.get("id"):
+                item["id"] = str(target["id"])
+                confirmed_targets[url] = target
+        elif action["category"] in ("runtime", "runtime_error", "download"):
+            # 初始化失败不能证明停用成功；回收本次失败源也计入共享预算。
+            item["active"] = original
+            if enabled and not original:
+                try:
+                    left = operation_deadline - time.monotonic()
+                    if left <= 0:
+                        raise TimeoutError
+                    code, cleanup = await _save_lx_http(
+                        request, "POST", "/api/v1/source", seconds=min(3.0, left),
+                        payload={"url": item.get("id") or url, "enabled": False,
+                                 "timeout_s": min(2.5, left)})
+                    if code == 200 and cleanup.get("ok") is True:
+                        item["active"] = False
+                        action["auto_disabled"] = True
+                except (httpx.HTTPError, TimeoutError):
+                    pass
+            if not enabled:
+                unknown.append((item, enabled, action))
+        else:
+            item["active"] = original
+            if action["category"] != "not_executed":
+                unknown.append((item, enabled, action))
+        if url not in desired and item.get("active"):
+            items.append(item)
+    # 所有未知写共享一次只读回查；不能因另一个源成功而确认目标源。
+    if unknown:
+        try:
+            sources = await _save_lx_snapshot(request, _save_remaining(3.0))
+        except (httpx.HTTPError, TimeoutError, ValueError):
+            pass
+        else:
+            for item, enabled, action in unknown:
+                target = _saved_source_target(sources, item)
+                # None 也可能表示身份歧义；停用只有完全没有候选才能确认。
+                absent = not any(_saved_source_target([s], item) for s in sources)
+                confirmed = (target is not None and target.get("status") == "success") if enabled else absent
+                if confirmed:
+                    item["active"] = enabled
+                    if target:
+                        item["id"] = str(target["id"])
+                        confirmed_targets[item["url"]] = target
+                    action.update(ok=True, error="", category="", confirmed_by_readback=True)
+    for action in actions:
+        if action["kind"] == "lx_activate" and not action["ok"]:
+            warnings.append({"source": action["source"], "url": action["url"],
+                             "message": action["error"], "category": action["category"],
+                             "auto_disabled": action.get("auto_disabled", False),
+                             "saved_active": next((bool(i.get("active")) for i in items
+                                                   if i["url"] == action["url"]), False)})
+    if legacy_url and actions and not actions[0]["ok"]:
+        return JSONResponse(status_code=400, content={
+            "ok": False, "complete": False, "error": f"洛雪源初始化未通过：{actions[0]['error']}",
+            "actions": actions, "warnings": warnings})
+    items = [i for i in items if i["url"] in desired or i.get("active")]
+    active = [i for i in items if i.get("active")]
+    if list_supplied or legacy_url:
+        updates["LX_SOURCE_LIST"] = _dumps_lx_list(items)
+        updates["LX_SOURCE_URL"] = active[0]["url"] if active else ""
+        platforms = []
+        for item in active:
+            target = confirmed_targets.get(item["url"]) or _saved_source_target(sources, item)
+            declared = target.get("platforms") or [] if target and target.get("status") == "success" else []
+            for platform in declared:
+                if platform not in platforms:
+                    platforms.append(platform)
+        if platforms or not active:
+            updates["LX_SOURCES"] = ",".join(platforms)
+    order = json.loads(updates.get("FNMUSIC_LX_SOURCE_ORDER", before.get("FNMUSIC_LX_SOURCE_ORDER") or "[]"))
+    for item in active:
+        if item.get("id") and item["id"] not in order:
+            order.append(item["id"])
+    normalized = json.dumps(order, ensure_ascii=False, separators=(",", ":"))
+    ready_ids = {str(s.get("id") or "") for s in sources if s.get("status") == "success"}
+    actual_order = [str(s.get("id") or "") for s in sources if str(s.get("id") or "") in ready_ids]
+    order_differs = actual_order != [sid for sid in order if sid in ready_ids]
+    order_changed = normalized != before.get("FNMUSIC_LX_SOURCE_ORDER", "[]")
+    auto_switch = str(updates.get(
+        "FNMUSIC_LX_AUTO_SWITCH", before.get("FNMUSIC_LX_AUTO_SWITCH", "true"))).lower()
+    if explicit_order and (order_changed or order_differs) and auto_switch not in ("false", "0", "no", "off"):
+        action = {"kind": "lx_reorder", "op": "reorder", "ok": False, "error": ""}
+        actions.append(action)
+        sent = False
+        try:
+            left = operation_deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError
+            sent = True
+            code, payload = await _save_lx_http(
+                request, "POST", "/api/v1/source/reorder", seconds=min(3.0, left),
+                payload={"source_ids": order, "timeout_s": min(2.5, left), "persist": False})
+            action.update(ok=code == 200 and payload.get("ok") is True,
+                          error="" if code == 200 and payload.get("ok") is True else
+                                redact(str(payload.get("error") or "排序未确认，保留原顺序")),
+                          category=payload.get("category") or "reorder_failed")
+        except (httpx.HTTPError, TimeoutError):
+            action.update(category="result_unknown" if sent else "not_executed",
+                          error="排序未确认，保留原顺序，请刷新运行状态" if sent else
+                                "保存预算已耗尽，未执行排序，保留原顺序")
+        if not action["ok"]:
+            updates.pop("FNMUSIC_LX_SOURCE_ORDER", None)
+        else:
+            updates["FNMUSIC_LX_SOURCE_ORDER"] = normalized
+    elif list_supplied or legacy_url or explicit_order:
+        updates["FNMUSIC_LX_SOURCE_ORDER"] = normalized
+    return None
+
+
 @app.put("/api/config")
 async def api_config_put(body: ConfigBody, request: Request):
+    # 不排队：后一个保存不能在旧请求完成后悄悄覆盖新配置。
+    if _config_save_lock.locked():
+        return JSONResponse(status_code=409, content={
+            "ok": False, "category": "save_busy", "error": "配置正在保存，请稍后重试"})
+    async with _config_save_lock:
+        started = time.monotonic()
+        token = _config_save_deadline.set(started + CONFIG_SAVE_TIMEOUT)
+        result = {"ok": True, "changed": [], "actions": [], "warnings": []}
+        status = 500
+        try:
+            async with asyncio.timeout(CONFIG_SAVE_TIMEOUT):
+                response = await _save_config(body, request, result)
+                status = response.status_code if isinstance(response, JSONResponse) else 200
+                return response
+        except TimeoutError:
+            status = 504
+            return JSONResponse(status_code=504, content={
+                **result, "ok": False, "complete": False, "category": "result_unknown",
+                "error": "保存已达到时限；已确认项保留，未完成操作的结果待核实，请刷新运行状态",
+            })
+        finally:
+            logger.info("[save] elapsed_s=%.3f status=%d changed=%d actions=%d failed=%d",
+                        time.monotonic() - started, status, len(result["changed"]),
+                        len(result["actions"]), sum(not a["ok"] for a in result["actions"]))
+            _config_save_deadline.reset(token)
+
+
+async def _save_config(body: ConfigBody, request: Request, result: dict):
     before = read_env()
     supplied = body.values or {}
     ignored_keys = sorted(key for key in supplied if key in RETIRED_CONFIG_KEYS)
@@ -1646,136 +1909,22 @@ async def api_config_put(body: ConfigBody, request: Request):
     after_preview.update(updates)
     lx_provider = current_provider(after_preview) == "lxmusic"
 
-    # 服务故障不得按脚本失效取消激活，也不得落盘。
+    actions = result["actions"]
+    warnings = result["warnings"]
+    # 服务准备、源操作、收尾共用同一个保存期限。
     if lx_provider:
-        ready = await _lx_ensure_ready(request, preview=current_provider(before) != "lxmusic")
+        ready = await _lx_ensure_ready(request, timeout=_save_remaining(min(12.0, LX_READY_TIMEOUT)),
+                                       preview=current_provider(before) != "lxmusic")
         if not ready["ok"]:
             return JSONResponse(content={"ok": False, "error": ready["error"],
                                          "category": "service_unavailable",
                                          "stage": ready["stage"]}, status_code=ready["status"])
 
-    # lx 多源激活集合：active_items 待激活列表、to_activate 新激活（需校验）、to_deactivate 被取消激活
-    active_items: list[dict] = []
-    to_activate: list[dict] = []
-    to_deactivate: list[dict] = []
-    items: list[dict] = []
-    lx_reconcile = False
-    warnings: list[dict] = []
-    failed_urls: set[str] = set()
-    verified_platforms: dict[str, list[str]] = {}
-
-    def disable_failed_source(url: str, message: str) -> None:
-        failed_urls.add(url)
-        for item in items:
-            if str(item.get("url") or "").strip() == url:
-                item["active"] = False
-                warnings.append({"source": str(item.get("name") or "") or url,
-                                 "url": url, "message": message})
-
-    def sync_lx_updates() -> None:
-        active_items[:] = [i for i in items if i.get("active")]
-        updates["LX_SOURCE_LIST"] = _dumps_lx_list(items)
-        updates["LX_SOURCE_URL"] = str(active_items[0]["url"]).strip() if active_items else ""
-
-    if lx_provider and "LX_SOURCE_LIST" in updates:
-        items = _derive_lx_list_actives(
-            _lx_list_items(updates["LX_SOURCE_LIST"]),
-            str(updates.get("LX_SOURCE_URL") or after_preview.get("LX_SOURCE_URL") or "").strip(),
-        )
-        active_items = [i for i in items if i.get("active") and str(i.get("url") or "").strip()]
-        # 自动停用全部失效源后，后续仍可保存其它设置；首次配置仍需选择源。
-        saved_items = _lx_list_items(before.get("LX_SOURCE_LIST"))
-        saved_all_inactive = (
-            current_provider(before) == "lxmusic" and bool(saved_items)
-            and all(i.get("active") is False for i in saved_items)
-            and not before.get("LX_SOURCE_URL")
-        )
-        if not active_items and not saved_all_inactive:
-            return JSONResponse(
-                content={"ok": False, "error": "请至少激活一个洛雪源"}, status_code=400
-            )
-        if active_items or saved_all_inactive:
-            lx_reconcile = True
-            # LX_SOURCE_URL 退化为派生兼容字段 = 第一个激活项
-            updates["LX_SOURCE_URL"] = str(active_items[0]["url"]).strip() if active_items else ""
-            after_preview["LX_SOURCE_URL"] = updates["LX_SOURCE_URL"]
-            before_active = _list_active_urls(before)
-            to_activate = [i for i in active_items
-                           if str(i["url"]).strip() not in before_active]
-            before_items = {str(i.get("url") or "").strip(): i for i in _lx_list_items(before.get("LX_SOURCE_LIST"))}
-            new_active = {str(i["url"]).strip() for i in active_items}
-            to_deactivate = [before_items.get(url, {"url": url})
-                             for url in before_active if url not in new_active]
-            updates["LX_SOURCE_LIST"] = _dumps_lx_list(items)
-
-    # lx 换源前置校验：列表中失效的新源自动取消激活，其余配置继续保存。
-    lx_url_changed = updates.get("LX_SOURCE_URL") not in (None, before.get("LX_SOURCE_URL", ""))
-    verify_urls: list[str] = []
-    if lx_provider:
-        if lx_reconcile:
-            verify_urls = [str(i["url"]).strip() for i in to_activate]
-        elif lx_url_changed:
-            verify_urls = [str(updates["LX_SOURCE_URL"] or "").strip()]
     client = get_http(request)
-    union_acc: list[str] = []  # LX_SOURCES 推导：新激活源声明平台 ∪ 现有启用源声明平台
-    for url in verify_urls:
-        if not url:
-            continue
-        verify_ok = False
-        verify_status = 0
-        try:
-            resp = await client.post(f"{CONF['lx_url']}/api/v1/source/verify",
-                                     json={"url": url}, timeout=130.0)
-            report = _resp_json(resp)
-            verify_ok = resp.status_code == 200 and bool(report.get("ok"))
-            verify_status = resp.status_code
-        except Exception as exc:  # noqa: BLE001
-            # 连不上 lxmusic 是服务故障，不是源失效：不要据此取消激活有效源
-            report = {"ok": False, "data": {"message": str(exc)},
-                      "category": "service_unavailable", "stage": "webui_to_lxmusic"}
-        if not verify_ok:
-            data = report.get("data") or {}
-            message = data.get("message") or report.get("error") or "校验失败"
-            category = report.get("category") or data.get("category")
-            has_evidence = bool(data.get("ok")) or any(
-                isinstance(a, dict) and a.get("result") == "ok" for a in data.get("attempts") or [])
-            incomplete = data.get("complete", report.get("complete")) is False and not has_evidence
-            protected = category in ("initialization_pending", "source_operation_busy", "internal",
-                                     "timeout", "identity_conflict", "unsafe_vm_required") or incomplete or bool(data.get("result_unknown"))
-            if _is_service_unavailable(verify_status, report) or protected or verify_status >= 500 and not category:
-                category = (category or "incomplete") if protected and category != "internal" else "service_unavailable"
-                return JSONResponse(
-                    content={"ok": False, "error": f"洛雪音源暂未就绪，未改动配置：{message}",
-                             "category": category,
-                             "stage": report.get("stage") or (report.get("data") or {}).get("stage")
-                                      or "webui_to_lxmusic"},
-                    status_code=409 if category == "source_operation_busy" else 504 if category in ("initialization_pending", "timeout") else 503,
-                )
-            if lx_reconcile:
-                disable_failed_source(url, message)
-                continue
-            return JSONResponse(
-                content={"ok": False, "error": f"洛雪源校验未通过：{message}"}, status_code=400
-            )
-        # LX_SOURCES 推导累计各新激活源声明平台
-        verified_platforms[url] = (report.get("data") or {}).get("platforms") or []
-        for p in (report.get("data") or {}).get("platforms") or []:
-            p = str(p).strip()
-            if p and p not in union_acc:
-                union_acc.append(p)
-
-    if lx_reconcile:
-        sync_lx_updates()
-        new_active = {str(i["url"]).strip() for i in active_items}
-        # 并入现有启用源声明平台（激活前读取，保持出现顺序）
-        for p in await _lx_enabled_platforms(request, failed_urls):
-            p = str(p).strip()
-            if p and p not in union_acc:
-                union_acc.append(p)
-    if union_acc:
-        updates.setdefault("LX_SOURCES", ",".join(union_acc))
-    elif lx_reconcile and not active_items:
-        updates["LX_SOURCES"] = ""
+    if lx_provider:
+        error = await _save_lx_updates(request, before, updates, actions, warnings)
+        if error is not None:
+            return error
 
     old_provider = current_provider(before)
     try:
@@ -1797,174 +1946,34 @@ async def api_config_put(body: ConfigBody, request: Request):
                         redact(f"{key}={new_val}").split("=", 1)[-1][:80])
     if old_provider != new_provider:
         logger.info("[src] 音源切换: %s -> %s", old_provider or "none", new_provider or "none")
-    actions: list[dict] = []
-
-    # 即使 .env 内容无 diff，若显式提交了 LX_SOURCE_URL/LX_SOURCE_LIST 且当前是 lxmusic，仍应重试激活
-    force_lx_activate = (
-        new_provider == "lxmusic"
-        and ("LX_SOURCE_URL" in updates or "LX_SOURCE_LIST" in updates)
-        and bool(after.get("LX_SOURCE_URL") or after.get("LX_SOURCE_LIST"))
-    )
-
-    # 常驻开启（非 musicbox 音源）时每次保存都过一遍对账：顺带自愈被手动
-    # 停掉/意外退出的 musicbox 进程
-    resident_bypass = resident_keep and new_provider != "musicbox"
-    if not changed and not force_lx_activate and not _preview_until and not resident_bypass:
-        return {"ok": True, "changed": [], "actions": [], "note": "配置无变化",
-                "ignored_keys": ignored_keys}
+    result["changed"] = changed
+    result["ignored_keys"] = ignored_keys
 
     # 音源切换（先停旧再起新）
     if old_provider != new_provider:
-        actions.extend(switch_provider_process(old_provider, "" if new_provider == "lxmusic" else new_provider,
-                                               keep_musicbox=resident_keep))
-
-    async def _lx_source_post(payload: dict, source: str, op: str) -> str:
-        api_payload: dict = {}
-        category = ""
-        status_code = 0
-        target = None
-        try:
-            resp = await client.post(f"{CONF['lx_url']}/api/v1/source",
-                                     json=payload, timeout=130.0)
-            api_payload = _resp_json(resp)
-            status_code = resp.status_code
-            data = api_payload.get("data") or {}
-            category = api_payload.get("category") or data.get("category") or ""
-            ok = resp.status_code == 200 and api_payload.get("ok") is True
-            err = "" if ok else (api_payload.get("error") or data.get("message") or f"HTTP {resp.status_code}")
-            if op == "activate":
-                sid = str(api_payload.get("source_id") or "")
-                req_url = str(payload.get("url") or "")
-                req_base = urllib.parse.unquote(req_url).replace("\\", "/").rsplit("/", 1)[-1] if req_url.startswith("file://") else ""
-                req_stem = req_base[:-3] if req_base.lower().endswith(".js") else req_base
-                entries = [entry for entry in data.get("sources") or [] if isinstance(entry, dict)]
-                # 强身份优先；文件名/名称兜底只接受唯一候选，不能误用同名源状态。
-                for matches in (
-                    [entry for entry in entries if sid and str(entry.get("id") or "") == sid],
-                    [entry for entry in entries if req_url and entry.get("url") == req_url],
-                    [entry for entry in entries if (
-                        (req_base and str(entry.get("id") or "") in (req_base, req_stem))
-                        or (req_stem and str(entry.get("name") or "") == req_stem)
-                    )],
-                ):
-                    if matches:
-                        target = matches[0] if len(matches) == 1 else None
-                        break
-                if target and target.get("status") == "failed" and category not in (
-                        "service_unavailable", "source_operation_busy", "initialization_pending", "internal"):
-                    ok, category = False, "runtime"
-                    err = target.get("error") or err or "源初始化失败"
-                elif ok and (not target or target.get("status") != "success"):
-                    # source_id、initialized=true 或另一个成功源都不能证明目标已就绪。
-                    ok, category = False, "initialization_pending"
-                    err = "源初始化结果待定，请稍后查看运行状态"
-                elif not ok and not category:
-                    category = "service_unavailable" if status_code >= 500 else "initialization_pending"
-        except Exception as exc:  # noqa: BLE001
-            ok, err = False, str(exc)
-            category = "service_unavailable"
-            api_payload = {"stage": "webui_to_lxmusic"}
-        actions.append({"kind": "lx_activate", "op": op, "source": source,
-                        "ok": ok, "error": err or ""})
-        if not ok:
-            actions[-1]["category"] = category or "service_unavailable"
-            actions[-1]["stage"] = (api_payload.get("stage")
-                                     or (api_payload.get("data") or {}).get("stage")
-                                     or "webui_to_lxmusic")
-        return str(api_payload.get("source_id") or (target or {}).get("id") or "") if ok else ""
-
-    # lx 多源对账激活：停用被取消项，再按列表顺序叠加激活全部 active 项
-    if new_provider == "lxmusic" and (lx_reconcile or lx_url_changed or force_lx_activate):
-        if lx_reconcile:
-            for item in to_deactivate:
-                url = str(item.get("url") or "").strip()
-                await _lx_source_post({"url": url, "enabled": False},
-                                      str(item.get("name") or "") or url, "deactivate")
-            target_ids: set[str] = set()
-            activation_service_failed = any(
-                not a.get("ok") and a.get("category") not in ("runtime", "runtime_error") for a in actions)
-            for item in active_items:
-                url = str(item["url"]).strip()
-                sid = await _lx_source_post({"url": url},
-                                            str(item.get("name") or "") or url, "activate")
-                if sid:
-                    # 保存 lxserver 返回的身份 ID，后续停用、重排和重新激活共用同一身份。
-                    item["id"] = sid
-                    target_ids.add(sid)
-                    order_ids = json.loads(updates.get(
-                        "FNMUSIC_LX_SOURCE_ORDER", before.get("FNMUSIC_LX_SOURCE_ORDER", "[]")))
-                    if sid not in order_ids:
-                        order_ids.append(sid)
-                    updates["FNMUSIC_LX_SOURCE_ORDER"] = json.dumps(
-                        order_ids, ensure_ascii=False, separators=(",", ":"))
-                if not actions[-1]["ok"]:
-                    if actions[-1].get("category") not in ("runtime", "runtime_error"):
-                        activation_service_failed = True
-                        # 忙、初始化待定、通信故障均保留配置，不误删正在运行的源。
-                        warnings.append({"source": str(item.get("name") or "") or url,
-                                         "url": url, "message": actions[-1]["error"],
-                                         "category": actions[-1].get("category") or "initialization_pending"})
-                    else:
-                        disable_failed_source(url, actions[-1]["error"])
-                        actions[-1]["auto_disabled"] = True
-            # 激活失败也写回取消激活状态，避免重开页面仍显示已激活。
-            sync_lx_updates()
-            new_active = {str(i["url"]).strip() for i in active_items}
-            # 不仅比较已写入的 .env：失败的停用仍会出现在实际启用集合中。
-            # 已自动停用失败项，按最终激活集合清理实际仍启用的脚本。
-            try:
-                actual = [] if activation_service_failed else await _lx_enabled_sources(request)
-                for s in actual:
-                    sid = str(s.get("id") or "")
-                    url = str(s.get("url") or "")
-                    if sid in target_ids or url in new_active:
-                        continue
-                    if sid or url:
-                        await _lx_source_post({"url": sid or url, "enabled": False},
-                                              str(s.get("name") or sid or url), "deactivate")
-            except Exception as exc:
-                actions.append({"kind": "lx_activate", "op": "reconcile", "source": "",
-                                "ok": False, "error": str(exc)})
-            if failed_urls:
-                remaining_platforms: list[str] = []
-                for item in active_items:
-                    url = str(item["url"]).strip()
-                    for p in verified_platforms.get(url, []):
-                        p = str(p).strip()
-                        if p and p not in remaining_platforms:
-                            remaining_platforms.append(p)
-                for p in await _lx_enabled_platforms(request, failed_urls):
-                    if p not in remaining_platforms:
-                        remaining_platforms.append(p)
-                updates["LX_SOURCES"] = ",".join(remaining_platforms) if active_items else ""
-                corrections = write_env({k: updates[k] for k in (
-                    "LX_SOURCE_LIST", "LX_SOURCE_URL", "LX_SOURCES", "FNMUSIC_LX_SOURCE_ORDER")
-                    if k in updates})
-                changed.extend(k for k in corrections if k not in changed)
-                after = read_env()
-            else:
-                # 初次激活会返回真正 source.id；保存后非 LX 主音源也能只读展示稳定顺序。
-                corrections = write_env({
-                    "LX_SOURCE_LIST": updates["LX_SOURCE_LIST"],
-                    "FNMUSIC_LX_SOURCE_ORDER": updates.get(
-                        "FNMUSIC_LX_SOURCE_ORDER", before.get("FNMUSIC_LX_SOURCE_ORDER", "[]")),
-                })
-                changed.extend(k for k in corrections if k not in changed)
-                after = read_env()
-        else:
-            await _lx_source_post({"url": after["LX_SOURCE_URL"]}, "", "activate")
+        actions.extend(await run_in_threadpool(
+            switch_provider_process, old_provider, "" if new_provider == "lxmusic" else new_provider,
+            keep_musicbox=resident_keep))
     elif new_provider == "musicdl" and (
         "FNMUSIC_ONLINE_SOURCES" in changed or "MUSICDL_SOURCES" in changed
     ):
-        code, out = supervisorctl("restart", "musicdl")
+        code, out = await run_in_threadpool(supervisorctl, "restart", "musicdl")
         actions.append({"kind": "process", "program": "musicdl", "op": "restart",
                         "ok": code == 0, "error": "" if code == 0 else out})
 
     # 预览收尾：保存启用的转正常驻，其余预览进程立即停止（常驻生效时保留 musicbox）
-    actions.extend(preview_reconcile_after_save(keep_musicbox=resident_keep))
+    actions.extend(await run_in_threadpool(preview_reconcile_after_save, keep_musicbox=resident_keep))
 
     # 网易云歌单常驻对账收口：切源保留的进程验证登录、开启/关闭/自愈拉起
-    if new_provider != "musicbox":
+    resident_keys = {_RESIDENT_FLAG, "FNMUSIC_NETEASE_MY_PLAYLISTS",
+                     "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED", "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION",
+                     "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER"}
+    resident_needed = (old_provider != new_provider or resident_keys & set(changed)
+                       or resident_keys & set(updates) and not _resident_state["active"])
+    if new_provider != "musicbox" and resident_keep and not resident_needed:
+        # 常驻正常时不重复校验登录；进程意外退出仍保留原有自愈能力。
+        resident_needed = not await run_in_threadpool(_musicbox_proc_running)
+    if new_provider != "musicbox" and resident_needed:
         await _reconcile_musicbox_resident(
             client, after, actions,
             warn=bool({_RESIDENT_FLAG, "FNMUSIC_NETEASE_MY_PLAYLISTS"} & set(updates)
@@ -1972,8 +1981,10 @@ async def api_config_put(body: ConfigBody, request: Request):
         )
 
     restart_keys = [k for k in changed if SCHEMA.get(k, {}).get("reload") == "restart"]
-    return {"ok": True, "changed": changed, "actions": actions, "restart_keys": restart_keys,
-            "warnings": warnings, "ignored_keys": ignored_keys}
+    result.update(restart_keys=restart_keys, complete=not warnings and all(a["ok"] for a in actions),
+                  values={key: value for key, value in after.items() if key in SCHEMA
+                          and SCHEMA[key].get("kind") != "secret"})
+    return result
 
 
 @app.get("/api/llm/usage")
@@ -2011,6 +2022,14 @@ async def _proxy_lx_source_reorder(request: Request, source_ids: list[str]):
 @app.post("/api/lx/source/reorder")
 async def api_lx_source_reorder(body: SourceReorderBody, request: Request):
     """保存稳定 ID 顺序；仅洛雪主音源启用时访问上游，不因查看/保存设置启动服务。"""
+    if _config_save_lock.locked():
+        return JSONResponse(status_code=409, content={
+            "ok": False, "category": "save_busy", "error": "配置正在保存，请稍后重试排序"})
+    async with _config_save_lock:
+        return await _save_lx_reorder(body, request)
+
+
+async def _save_lx_reorder(body: SourceReorderBody, request: Request):
     try:
         normalized = _normalize_lx_source_order(body.source_ids)
         source_ids = json.loads(normalized)
@@ -2421,10 +2440,15 @@ def _export_log_files(directory: Path):
     """关于页与导出共用清单：近 3 天的普通文件，不跟随符号链接。"""
     cutoff = time.time() - RETENTION_DAYS * 86400
     try:
+        if not stat.S_ISDIR(directory.lstat().st_mode):
+            return
         for item in sorted(directory.iterdir(), key=lambda p: p.name):
             try:
                 st = item.lstat()
-                if (stat.S_ISREG(st.st_mode) and item.suffix != ".logzip"
+                if (stat.S_ISREG(st.st_mode) and st.st_nlink == 1
+                        and item.suffix not in (".logzip", ".zip")
+                        and item.name not in ("log_collection.json", "proxy_diagnostics.json",
+                                              "export_env_snapshot.txt")
                         and st.st_mtime >= cutoff):
                     yield item, st
             except OSError:
@@ -2436,9 +2460,39 @@ def _export_log_files(directory: Path):
 def _log_files_info() -> "list[dict]":
     """可导出的日志文件清单（名称/大小/修改时间），不展示临时导出包。"""
     return [
-        {"name": item.name, "size": st.st_size, "mtime": int(st.st_mtime)}
-        for item, st in _export_log_files(log_dir())
+        {"name": prefix + item.name, "size": st.st_size, "mtime": int(st.st_mtime)}
+        for prefix, directory in _log_sources(log_dir())
+        for item, st in _export_log_files(directory)
+        if _include_log(prefix, item.name)
     ]
+
+
+def _log_sources(directory: Path) -> list[tuple[str, Path]]:
+    """Docker 已挂载仓库 /repo；读取宿主 logs，无需新挂载或放宽权限。"""
+    host = Path(CONF["repo_dir"]) / "logs"
+    sources = [("", directory)]
+    if os.path.normcase(os.path.abspath(host)) != os.path.normcase(os.path.abspath(directory)):
+        sources.append(("host/", host))
+    return sources
+
+
+def _include_log(prefix: str, name: str) -> bool:
+    # 宿主只收集固定诊断文件，不把仓库日志目录中的任意资料带出。
+    return not prefix or name == "env_snapshot.txt" or re.fullmatch(
+        r"(?:proxy|install)\.log(?:\.[0-9-]+(?:\.[0-9]{8})?)?", name) is not None
+
+
+async def _proxy_diagnostics() -> dict:
+    try:
+        result = await asyncio.wait_for(_try_maintenance_socket(
+            "GET", "/api/diagnostics/status", timeout=2.5), timeout=3.0)
+        if isinstance(result, dict) and result.get("ok") is True:
+            return {"status": "reachable", **result}
+        return {"status": "unavailable",
+                "reason": "host_error" if isinstance(result, JSONResponse) else "maintenance_socket_unavailable",
+                "note": "无法确认代理接管状态；不能仅据此认定代理未运行"}
+    except Exception as exc:
+        return {"status": "unavailable", "reason": type(exc).__name__}
 
 
 def _redact_chunk(raw: bytes) -> bytes:
@@ -2484,26 +2538,61 @@ def _copy_redacted(source, member, *, limit_bytes: int = 32 * 1024 * 1024) -> No
 
 def _write_log_archive(directory: Path, target: Path) -> None:
     """在线程池中执行日志读取、压缩与环境探测。"""
+    manifest = {"sources": []}
     with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
-        for item, listed in _export_log_files(directory):
+        for prefix, source in _log_sources(directory):
+            summary = {"scope": "host" if prefix else "service", "status": "ok", "files": [], "errors": []}
+            manifest["sources"].append(summary)
+            directory_fd = None
             try:
-                # lstat 后文件仍可能被换成链接/FIFO；打开时也拒绝跟随/阻塞。
-                open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-                fd = os.open(item, open_flags)
-                with os.fdopen(fd, "rb") as source:
-                    opened = os.fstat(source.fileno())
-                    if (not stat.S_ISREG(opened.st_mode)
-                            or (opened.st_dev, opened.st_ino) != (listed.st_dev, listed.st_ino)):
+                directory_info = source.lstat()
+                if not stat.S_ISDIR(directory_info.st_mode):
+                    summary["status"] = "unsafe_directory"
+                    continue
+                list(source.iterdir())
+                # Linux 固定目录描述符，避免共享仓库中的 logs 被换成链接后越界读取。
+                if os.name == "posix" and hasattr(os, "O_DIRECTORY"):
+                    directory_fd = os.open(source, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                    opened = os.fstat(directory_fd)
+                    if (opened.st_dev, opened.st_ino) != (directory_info.st_dev, directory_info.st_ino):
+                        summary["status"] = "directory_changed"
+                        os.close(directory_fd)
                         continue
-                    # issue #108：逐行脱敏后写入，避免一次性读入整个大日志文件。
-                    with zf.open(item.name, "w") as member:
-                        _copy_redacted(source, member)
-            except OSError:
+            except OSError as exc:
+                summary["status"] = "missing" if isinstance(exc, FileNotFoundError) else "unreadable"
+                summary["errors"].append(type(exc).__name__)
+                if directory_fd is not None:
+                    os.close(directory_fd)
                 continue
+            try:
+                for item, listed in _export_log_files(source):
+                    if not _include_log(prefix, item.name):
+                        continue
+                    try:
+                        open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                        fd = (os.open(item.name, open_flags, dir_fd=directory_fd)
+                              if directory_fd is not None else os.open(item, open_flags))
+                        with os.fdopen(fd, "rb") as stream:
+                            opened = os.fstat(stream.fileno())
+                            if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+                                    or (opened.st_dev, opened.st_ino) != (listed.st_dev, listed.st_ino)):
+                                summary["errors"].append({"file": item.name, "error": "identity_changed"})
+                                continue
+                            with zf.open(prefix + item.name, "w") as member:
+                                _copy_redacted(stream, member)
+                            summary["files"].append(item.name)
+                    except OSError as exc:
+                        summary["errors"].append({"file": item.name, "error": type(exc).__name__})
+            finally:
+                if directory_fd is not None:
+                    os.close(directory_fd)
+            if summary["errors"] or (prefix and "proxy.log" not in summary["files"]):
+                summary["status"] = "incomplete"
         snapshot = "\n".join(env_snapshot_lines(
             "container" if Path("/.dockerenv").exists() else "host"))
         # 环境快照同样过一遍脱敏：它可能包含config摘要里遗漏的秘密值。
         zf.writestr("export_env_snapshot.txt", redact(snapshot) + "\n")
+        zf.writestr("log_collection.json", json.dumps(manifest, ensure_ascii=False, indent=2))
 
 
 class _LogExportResponse(FileResponse):
@@ -2583,14 +2672,15 @@ async def api_update_check(request: Request):
 
 @app.get("/api/logs/export")
 async def api_logs_export():
-    """近 3 天日志 + 环境快照；下载名为 <YYYYMMDDHHMMSS>.logzip。
+    """近 3 天日志 + 环境快照；下载名为 fnmusic-logs-<时间>-<随机串>.zip。
 
     每个请求独占系统临时目录（不在日志目录内，避免日志清理影响下载）。
     压缩在线程池执行；仅在本响应发送结束后清理，不保留历史导出包，
     因此磁盘占用限于仍在压缩/发送的请求，同秒导出也不会互相覆盖。
     """
     directory = log_dir()
-    filename = f"{time.strftime('%Y%m%d%H%M%S')}.logzip"
+    proxy_status = await _proxy_diagnostics()
+    filename = f"fnmusic-logs-{time.strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(4)}.zip"
     temp_dir = None
     try:
         # 不能在 worker 仍写包时取消并删除其目录；等压缩结束再移交给响应。
@@ -2599,9 +2689,14 @@ async def api_logs_export():
                 temp_dir = Path(await run_in_threadpool(tempfile.mkdtemp, prefix="fnmusic-log-export-"))
                 target = temp_dir / filename
                 await run_in_threadpool(_write_log_archive, directory, target)
+                def append_status():
+                    with zipfile.ZipFile(target, "a", zipfile.ZIP_DEFLATED) as archive:
+                        archive.writestr("proxy_diagnostics.json",
+                                         redact(json.dumps(proxy_status, ensure_ascii=False, indent=2)))
+                await run_in_threadpool(append_status)
                 response = _LogExportResponse(
                     target,
-                    media_type="application/octet-stream",
+                    media_type="application/zip",
                     headers={"Content-Disposition": f'attachment; filename="{filename}"'},
                 )
             except BaseException:
@@ -2613,6 +2708,15 @@ async def api_logs_export():
         return JSONResponse(content={"ok": False, "error": f"日志打包失败: {exc}"}, status_code=500)
     logger.info("[diag] log_export file=%s", filename)
     return response
+
+
+@app.post("/api/logs/export")
+async def api_logs_export_to_nas():
+    """NAS 保存只允许宿主网关拦截；直连 WebUI 不接受任意写入路径。"""
+    return JSONResponse(
+        content={"ok": False, "error": "保存到 NAS 需要在飞牛 App 或飞牛桌面内操作"},
+        status_code=501,
+    )
 
 
 # ------------------------------------------------------------------ 静态前端 --
